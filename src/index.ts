@@ -106,22 +106,47 @@ export function apply(ctx: Context, config?: MemoryPluginConfig | null): void {
         model: config?.llm?.model ?? DEFAULT_LLM_ROUTE.model,
       },
       route: () => {
+        // Resolution order (per-field, first non-empty wins):
+        //   1. This plugin's explicit `memory.llm` override (user config).
+        //   2. The current session's default model — read live from the
+        //      deployment's `agent-default-model` namespace, so the plugin
+        //      runs on the same route the agent itself uses.
+        //   3. '' — `callMemoryLlm` then falls back to the composition-line
+        //      route as a last resort.
         // Defensive: settings documents persisted before the `llm` section
         // existed simply lack it — the schema default does not backfill
         // nested sections on every reader, so keep a local fallback.
         const st = getSettings();
         const l = st.llm ?? { provider: '', model: '', maxOutputTokens: 600, timeoutMs: 30000 };
-        return { provider: l.provider, model: l.model, maxOutputTokens: l.maxOutputTokens, timeoutMs: l.timeoutMs };
+        let provider = l.provider;
+        let model = l.model;
+        if (provider === '' || model === '') {
+          try {
+            const def = scoped.settings.get(settingsNamespace('agent-default-model')) as
+              | { provider?: string; model?: string }
+              | undefined;
+            if (def !== undefined) {
+              if (provider === '' && typeof def.provider === 'string') provider = def.provider;
+              if (model === '' && typeof def.model === 'string') model = def.model;
+            }
+          } catch {
+            // namespace not registered in this composition — keep the gap.
+          }
+        }
+        return { provider, model, maxOutputTokens: l.maxOutputTokens, timeoutMs: l.timeoutMs };
       },
     };
 
     void MemoryCore.create({ logger })
       .then((core) => {
         // The timer service is OPTIONAL (absent in minimal compositions).
-        // NOTE: cordis 4.x ctx property reads THROW for services not declared
+        // NOTE 1: cordis 4.x ctx property reads THROW for services not declared
         // in `inject` ("cannot get property X without inject"), so the timer
         // is resolved through the lenient `ctx.get` and passed as a plain
         // object — never read off the ctx proxy.
+        // NOTE 2: TimerService.timeout/interval are ordinary class methods
+        // that resolve `this.ctx.effect`; extracting them UNBOUND crashes on
+        // call ("reading 'effect'") — always bind the service instance.
         const timerSvc = ctx.get('timer') as
           | {
               timeout?: (fn: () => void, delayMs: number) => () => void;
@@ -129,8 +154,8 @@ export function apply(ctx: Context, config?: MemoryPluginConfig | null): void {
             }
           | undefined;
         const timers = {
-          timeout: timerSvc?.timeout,
-          interval: timerSvc?.interval,
+          timeout: timerSvc?.timeout?.bind(timerSvc),
+          interval: timerSvc?.interval?.bind(timerSvc),
         };
         const engine: DreamEngine = registerDream(timers, core, getSettings, logger, llmDeps);
         registerMemoryTools(ctx, core, getSettings, engine, logger);

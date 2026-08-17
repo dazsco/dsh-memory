@@ -1,9 +1,11 @@
 /**
  * Budgeted auxiliary LLM seam for dsh-memory (capture + Dream passes).
  *
- * Route resolution (first non-empty wins):
+ * Route resolution (per-field, first non-empty wins):
  *   1. User settings override: `memory.llm.provider` / `memory.llm.model`
- *   2. Plugin composition route (cordis row config; shipped default
+ *   2. The current session's default model (`agent-default-model` settings
+ *      namespace, read live) — the route the agent itself runs on
+ *   3. Plugin composition route (cordis row config; shipped default
  *      `deepseek` / `deepseek-v4-flash`)
  *
  * Every failure degrades to the heuristic path — this module never throws
