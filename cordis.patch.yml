@@ -1,0 +1,16 @@
+# Bundle patch for the dsh-memory plugin: inserts the memory service row into
+# the profile roster. Installed with `dsh plugin --profile web add <package>`
+# or `dsh plugin --profile web add link:<repo path>`.
+#
+# The row hosts the whole memory system (store, capture, recall, rules, Dream)
+# as ONE process-global service: memory is shared across sessions by design,
+# so the provider belongs in the host plane (profile composition), never in an
+# agent preset.
+- insert:
+    - id: dsh-memory
+      name: 'dsh-memory'
+      # Default auxiliary LLM route for capture/Dream passes. Users override
+      # per-instance with memory.llm.provider / memory.llm.model settings.
+      llm:
+        provider: deepseek
+        model: deepseek-v4-flash

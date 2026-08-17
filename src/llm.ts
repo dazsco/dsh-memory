@@ -1,0 +1,283 @@
+/**
+ * Budgeted auxiliary LLM seam for dsh-memory (capture + Dream passes).
+ *
+ * Route resolution (first non-empty wins):
+ *   1. User settings override: `memory.llm.provider` / `memory.llm.model`
+ *   2. Plugin composition route (cordis row config; shipped default
+ *      `deepseek` / `deepseek-v4-flash`)
+ *
+ * Every failure degrades to the heuristic path — this module never throws
+ * into a capture or Dream run. One call = one `ctx.llm.stream()` request,
+ * bounded by `maxOutputTokens`, a deadline (dsh-timeout), and the caller's
+ * per-run budget counter.
+ */
+import { BlockAssembler, createUserMessage, deepFreeze } from '@deepseek-ai/dsh-llm';
+import { deadline, timeoutOf } from '@deepseek-ai/dsh-timeout';
+import type { StreamChunk, UserMessage } from '@deepseek-ai/dsh-llm';
+
+const TIMEOUT_CODE = 'MEMORY_LLM_TIMEOUT';
+
+/** The subset of the `llm` service dsh-memory consumes. */
+export interface MemoryLlmService {
+  listProviders(): ReadonlyArray<{ id: string; name: string }>;
+  stream(options: {
+    provider: string;
+    model: string;
+    messages: UserMessage[];
+    system?: string;
+    maxTokens?: number;
+    temperature?: number;
+    signal?: AbortSignal;
+  }): AsyncIterable<StreamChunk>;
+}
+
+export interface MemoryLlmDeps {
+  /** `ctx.get('llm')`; absent → every call degrades. */
+  llm: MemoryLlmService | null;
+  logger?: { warn(msg: string): void } | null;
+  /** Route declared on the plugin composition row. */
+  configRoute: { provider: string; model: string };
+  /** Live settings route/budget (empty provider/model = use config route). */
+  route: () => { provider: string; model: string; maxOutputTokens: number; timeoutMs: number };
+}
+
+export type LlmFailReason = 'no-service' | 'no-route' | 'unregistered' | 'timeout' | 'aborted' | 'max-tokens' | 'error';
+
+export type LlmResult =
+  | { ok: true; text: string; route: { provider: string; model: string } }
+  | { ok: false; reason: LlmFailReason; message?: string };
+
+export interface MemoryLlmRequest {
+  system: string;
+  user: string;
+  /** Per-call override of the settings budget (Dream passes use smaller outputs). */
+  maxOutputTokens?: number;
+}
+
+/**
+ * Run one auxiliary model call. Never throws: all failure classes (missing
+ * service, unregistered route, timeout, provider error) become `ok: false`.
+ */
+export async function callMemoryLlm(deps: MemoryLlmDeps, request: MemoryLlmRequest): Promise<LlmResult> {
+  const llm = deps.llm;
+  if (llm === null) return { ok: false, reason: 'no-service' };
+  const live = deps.route();
+  const provider = live.provider !== '' ? live.provider : deps.configRoute.provider;
+  const model = live.model !== '' ? live.model : deps.configRoute.model;
+  if (provider === '' || model === '') return { ok: false, reason: 'no-route' };
+  let ids: string[];
+  try {
+    ids = llm.listProviders().map((p) => p.id);
+  } catch {
+    return { ok: false, reason: 'no-service' };
+  }
+  if (!ids.includes(provider)) return { ok: false, reason: 'unregistered' };
+
+  const messages: UserMessage[] = [
+    createUserMessage({
+      content: [{ type: 'text', text: request.user }],
+      source: { kind: 'plugin', plugin: 'dsh-memory' },
+    }),
+  ];
+  const callDeadline = deadline(undefined, live.timeoutMs, TIMEOUT_CODE);
+  try {
+    const options = deepFreeze({
+      provider,
+      model,
+      messages,
+      system: request.system,
+      maxTokens: request.maxOutputTokens ?? live.maxOutputTokens,
+      temperature: 0.2,
+      signal: callDeadline.signal,
+    });
+    const assembler = new BlockAssembler();
+    for await (const chunk of llm.stream(options)) {
+      callDeadline.signal.throwIfAborted();
+      assembler.push(chunk);
+    }
+    const finish = assembler.finish;
+    switch (finish.kind) {
+      case 'stop': {
+        const text = assembler
+          .blocks()
+          .filter((b) => b.type === 'text')
+          .map((b) => b.text)
+          .join('');
+        return { ok: true, text, route: { provider, model } };
+      }
+      case 'aborted': {
+        const timedOut = timeoutOf(callDeadline.signal, TIMEOUT_CODE) !== undefined;
+        return { ok: false, reason: timedOut ? 'timeout' : 'aborted', message: finish.failure?.message };
+      }
+      case 'max-tokens':
+        return { ok: false, reason: 'max-tokens' };
+      case 'tool-calls':
+        return { ok: false, reason: 'error', message: 'model requested a tool; refused' };
+      case 'error':
+        return { ok: false, reason: 'error', message: finish.failure?.message };
+      default:
+        return { ok: false, reason: 'error', message: `unknown finish reason "${String((finish as { kind?: unknown }).kind ?? finish)}"` };
+    }
+  } catch (err) {
+    const timedOut = timeoutOf(callDeadline.signal, TIMEOUT_CODE) !== undefined;
+    return {
+      ok: false,
+      reason: timedOut ? 'timeout' : 'error',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    callDeadline[Symbol.dispose]();
+  }
+}
+
+// ── output parsing ───────────────────────────────────────────────────────────
+
+const LINE_MIN = 4;
+const LINE_MAX = 400;
+const MARKER_RE = /^\s*(?:[-*•]\s*|\d+[.)]\s*|【[^】]{1,12}】\s*)/;
+const QUOTE_PAIRS: [string, string][] = [
+  ['「', '」'],
+  ['“', '"'],
+  ['"', '"'],
+  ["'", "'"],
+];
+
+/**
+ * Parse one LLM extraction reply into candidate lines. Tolerant of list
+ * markers, surrounding quote pairs, and a `NONE` reply. Empty input → [].
+ */
+export function parseLlmMemoryLines(text: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of text.split(/\r?\n/)) {
+    let line = raw.trim();
+    if (line.length === 0) continue;
+    if (/^none\b/i.test(line)) continue;
+    line = line.replace(MARKER_RE, '').trim();
+    for (const [o, c] of QUOTE_PAIRS) {
+      if (line.startsWith(o) && line.endsWith(c) && line.length - o.length - c.length >= 2) {
+        line = line.slice(o.length, line.length - c.length).trim();
+        break;
+      }
+    }
+    if (line.length < LINE_MIN || line.length > LINE_MAX) continue;
+    const key = line.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(line);
+  }
+  return out;
+}
+
+const PREFERENCE_RE = /(偏好|习惯|prefer|always|from now on|going forward|统一|固定|永远|默认|总是|始终|不要|别再|必须|都要)/i;
+
+/** Classify a parsed line: preference-shaped → 'preference', else 'fact'. */
+export function classifyLlmLine(line: string): 'fact' | 'preference' {
+  return PREFERENCE_RE.test(line) ? 'preference' : 'fact';
+}
+
+/** The extraction system prompt (bilingual, output contract is line-based). */
+export const CAPTURE_LLM_SYSTEM = [
+  '你是记忆抽取助手。从给定的对话尾部中抽取值得长期记住的信息。',
+  'You are a memory extractor. Pull durable memories from the conversation tail below.',
+  'Rules / 规则:',
+  '- Only output what is durable: stable facts, user preferences, decisions, procedures, commitments, project conventions.',
+  '- 只输出值得长期记住的内容：稳定事实、用户偏好、决定、流程、承诺、项目约定。',
+  '- One memory per line; plain text; no JSON, no markdown markers, no explanations.',
+  '- Never output secrets (keys, tokens, passwords) — skip any line containing one.',
+  '- Never invent; if nothing is worth remembering, output exactly: NONE',
+  '- 不要编造；如果没有值得记住的，只输出：NONE',
+].join('\n');
+
+/**
+ * Build the extraction user prompt. `known` are the heuristic candidates
+ * already staged for this turn, so the model does not repeat them.
+ */
+export function buildCaptureLlmUserPrompt(tail: string, known: string[]): string {
+  const body = tail.length > 0 ? tail : '(empty)';
+  const knownSection = known.length > 0 ? `\nAlready captured (do not repeat) / 已捕获（勿重复）:\n${known.map((k) => `- ${k}`).join('\n')}\n` : '';
+  return `Conversation tail / 对话尾部:${knownSection}\n---\n${body}`;
+}
+
+// ── Dream LLM passes ─────────────────────────────────────────────────────────
+
+/** One card as presented to a Dream LLM pass (excerpt only, never full body). */
+export interface DreamCardLine {
+  id: string;
+  kind: string;
+  title: string;
+  body: string;
+  importance: number;
+}
+
+export const DREAM_SUMMARIZE_SYSTEM = [
+  '你是记忆库整理助手。根据给定记忆卡片写一段简洁的记忆库概览（3-6 句中文），',
+  '概括这个记忆库主要包含哪些主题、用户偏好、项目约定和重要决定。',
+  'You are a memory-library organizer. Write a concise 3-6 sentence Chinese overview of these cards: the main topics, user preferences, project conventions, and key decisions.',
+  '只输出概览文本本身；不要标题、编号或解释。',
+  'Output only the overview text; no headings, numbering, or explanations.',
+  '如果没有值得概括的内容，只输出：NONE',
+].join('\n');
+
+/** Build the summarize prompt. Cards are excerpted to 160 chars of body. */
+export function buildSummarizeUserPrompt(slug: string, cards: DreamCardLine[]): string {
+  const lines = cards.map((c) => `- ${c.id} | ${c.kind} | imp=${c.importance} | ${c.title}\n  ${c.body.slice(0, 160).replace(/\s+/g, ' ')}`);
+  return `Store: ${slug}\nCards (${cards.length}):\n${lines.join('\n')}`;
+}
+
+/** Sanitize a summarize reply: trim, reject NONE/empty, cap length. */
+export function parseSummaryText(text: string, maxChars = 800): string | null {
+  const t = text.trim().replace(/\s+/g, ' ');
+  if (t.length === 0 || /^none$/i.test(t)) return null;
+  return t.slice(0, maxChars);
+}
+
+export const DREAM_CONFLICT_SYSTEM = [
+  '下面给出几组近似重复的记忆卡片（组号 G1、G2...，每组 A/B 两条）。',
+  '判断每组应保留哪一条：内容相同的保留更完整/更新的一条；互补的都可保留。',
+  '每组输出恰好一行，格式：G<编号> <保留的id>  或  G<编号> both',
+  '只输出这些行，不要任何解释或多余文字。',
+  'Below are groups of near-duplicate memory cards. For each group output exactly one line:',
+  'G<number> <kept-id>   or   G<number> both. Output nothing else.',
+].join('\n');
+
+export interface ConflictPair {
+  a: DreamCardLine;
+  b: DreamCardLine;
+  similarity: number;
+}
+
+/** Build the conflict-decision prompt from near-duplicate pairs. */
+export function buildConflictUserPrompt(pairs: ConflictPair[]): string {
+  const parts = pairs.map((p, i) => {
+    const n = i + 1;
+    return `G${n} (jaccard≈${p.similarity.toFixed(2)}):\n  A) ${p.a.id} :: ${p.a.title} — ${p.a.body.slice(0, 160).replace(/\s+/g, ' ')}\n  B) ${p.b.id} :: ${p.b.title} — ${p.b.body.slice(0, 160).replace(/\s+/g, ' ')}`;
+  });
+  return parts.join('\n\n');
+}
+
+export type ConflictDecision = 'a' | 'b' | 'both';
+
+/**
+ * Parse conflict replies. Each line must name a known group and a known card
+ * id (or `both`); anything unparseable is skipped — the heuristic state is
+ * never corrupted by a malformed model reply.
+ */
+export function parseConflictDecisions(text: string, pairs: ConflictPair[]): Map<number, ConflictDecision> {
+  const out = new Map<number, ConflictDecision>();
+  for (const raw of text.split(/\r?\n/)) {
+    const m = /^G(\d+)\s+(\S+)/.exec(raw.trim());
+    if (!m) continue;
+    const idx = Number(m[1]) - 1;
+    const pair = pairs[idx];
+    if (!pair) continue;
+    const val = m[2];
+    if (val === undefined) continue;
+    let d: ConflictDecision | null = null;
+    if (/^both$/i.test(val)) d = 'both';
+    else if (val === pair.a.id) d = 'a';
+    else if (val === pair.b.id) d = 'b';
+    if (d !== null && !out.has(idx)) out.set(idx, d);
+  }
+  return out;
+}
