@@ -178,6 +178,7 @@ export function registerCapture(
     if (!s.enabled || s.capture.mode === 'off') return;
     const messages = sess.deriveMessages?.() ?? [];
     let tail = '';
+    let userTail = '';
     for (let i = messages.length - 1; i >= 0 && tail.length < s.capture.turnTailChars; i--) {
       const m = messages[i];
       if (m === undefined) continue;
@@ -196,11 +197,16 @@ export function registerCapture(
       // they are machine-generated, so skip them via their stable marker.
       if (m.role === 'user' && text.startsWith(CHECKPOINT_MARKER)) continue;
       tail = `${text}\n${tail}`;
+      if (m.role === 'user') userTail = `${text}\n${userTail}`;
     }
     tail = tail.slice(0, s.capture.turnTailChars);
     if (tail.trim().length < s.capture.minTurnContentChars) return;
 
-    const candidates = extractIntentSentences(tail);
+    // The intent heuristic runs on USER statements only: assistant text that
+    // quotes or discusses intent words (e.g. this plugin's own debugging)
+    // must never stage a verbatim card. The LLM pass still sees the full
+    // tail and is scope-disciplined by the system prompt.
+    const candidates = extractIntentSentences(userTail.slice(0, s.capture.turnTailChars));
     const cwd = sess.header?.cwd;
     const project = cwd ? await core.projectStoreForCwd(cwd).catch(() => null) : null;
     const targetStore = project ?? core.global;

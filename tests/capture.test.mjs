@@ -135,6 +135,62 @@ test('capture: plugin-injected brief and system-reminder boilerplate are exclude
   assert.ok(!inbox[0].content.includes('memory_remember'));
 });
 
+test('capture: assistant text containing intent words never stages a card', async () => {
+  // The observed leak: an assistant reply discussing/quoting intent words
+  // (e.g. this plugin's own debugging) produced verbatim cards. The
+  // heuristic must scan user statements only.
+  const inbox = [];
+  const fakeStore = {
+    slug: 'global',
+    audit: async () => {},
+    pushInbox: async (entry) => {
+      inbox.push(entry);
+    },
+  };
+  const fakeCore = {
+    global: fakeStore,
+    projectStoreForCwd: async () => null,
+    rulesFor: async () => ({ denyKeywords: [] }),
+  };
+  const listeners = new Map();
+  registerCapture({ on: (ev, fn) => listeners.set(ev, fn) }, fakeCore, () => defaultMemorySettings(), null, null);
+
+  const session = {
+    id: 'session-test-2',
+    header: { cwd: undefined, delegationDepth: 0 },
+    deriveMessages: () => [
+      { role: 'user', content: [{ type: 'text', text: '记忆系统的全局库为什么又混进了调试对话的内容？我明明只想让它记用户偏好和项目约定，现在连你自己排查问题的过程都被当成记忆卡片存进去了，这不符合预期，请解释原因并说明怎么避免。' }] },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: '原因是启发式正则把否定句里的触发词当成了意图。比如用户说过"那些临时结论不需要记住"，其中包含触发词，就被原样抓成了卡片。修复方案是：以后都统一用范围感知提示词加否定守卫来处理这类边界情况。',
+          },
+    ],
+    },
+    ],
+  };
+
+  listeners.get('session/event')(session, { type: 'turn/end' });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(inbox.length, 0, 'assistant-only intent words must not stage anything');
+
+  // Same words from the USER still stage.
+  const session2 = {
+    id: 'session-test-2b',
+    header: { cwd: undefined, delegationDepth: 0 },
+    deriveMessages: () => [
+      { role: 'user', content: [{ type: 'text', text: '记住这个项目的流程约定:代码评审要先跑一遍 typecheck,确认类型检查全部通过之后再提交合并请求,避免把类型错误带到主干分支上去,这个规则适用于所有改动,包括文档和配置文件的修改。' }] },
+      { role: 'assistant', content: [{ type: 'text', text: '好的,已了解。后续提交前我会先执行类型检查,确认全部通过再推送,这个规则会应用到所有类型的改动上,包括文档和配置文件,确保主干分支始终处于类型安全的状态。' }] },
+    ],
+  };
+  listeners.get('session/event')(session2, { type: 'turn/end' });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(inbox.length, 1);
+  assert.match(inbox[0].content, /typecheck/);
+});
+
 test('capture: non-turn events and delegated sessions are ignored', async () => {
   const inbox = [];
   const fakeStore = {
