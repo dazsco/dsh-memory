@@ -63,10 +63,23 @@ export function stripSystemReminders(text: string): string {
   return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
 }
 
-/** True for messages dsh-memory itself injected (the session-start brief). */
-function isPluginInjected(source: { kind?: string; plugin?: string } | null | undefined): boolean {
-  return source?.kind === 'plugin' && source?.plugin === 'dsh-memory';
+/**
+ * Machine-injected content is never a user statement: any message whose
+ * source is a plugin injection or a tool result is skipped, regardless of
+ * which plugin produced it (dsh-memory brief, harness checkpoints that ride
+ * plugin sources, ...). Unknown / merge-extensible source kinds are kept.
+ */
+function isMachineInjected(source: { kind?: string; plugin?: string } | null | undefined): boolean {
+  return source?.kind === 'plugin' || source?.kind === 'tool';
 }
+
+/**
+ * Harness checkpoint/compaction summaries arrive as user-role messages whose
+ * body QUOTES earlier conversation (which may contain genuine intent words
+ * like 记住 / "always use"). Machine-generated → skipped via their stable
+ * opening marker.
+ */
+const CHECKPOINT_MARKER = 'This is an automatically generated checkpoint';
 
 /** Split text into sentences (CJK + latin terminators). */
 export function splitSentences(text: string): string[] {
@@ -150,16 +163,20 @@ export function registerCapture(
       const m = messages[i];
       if (m === undefined) continue;
       if (m.role !== 'user' && m.role !== 'assistant') continue;
-      // Skip messages dsh-memory injected itself (the session-start brief):
-      // machine context is never a user memory statement.
-      if (isPluginInjected(m.source)) continue;
+      // Skip machine-injected messages (any plugin/tool source): machine
+      // context is never a user memory statement.
+      if (isMachineInjected(m.source)) continue;
       const text = stripSystemReminders(
         (m.content ?? [])
           .filter((b) => b.type === 'text' && typeof b.text === 'string')
           .map((b) => b.text as string)
           .join(' '),
       ).trim();
-      if (text) tail = `${text}\n${tail}`;
+      if (!text) continue;
+      // Harness checkpoint summaries quote earlier turns (incl. intent words);
+      // they are machine-generated, so skip them via their stable marker.
+      if (m.role === 'user' && text.startsWith(CHECKPOINT_MARKER)) continue;
+      tail = `${text}\n${tail}`;
     }
     tail = tail.slice(0, s.capture.turnTailChars);
     if (tail.trim().length < s.capture.minTurnContentChars) return;

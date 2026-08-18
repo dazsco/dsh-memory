@@ -65,21 +65,24 @@ export const MemorySettingsSchema = z.object({
     .default({ maxCardBytes: 4096, maxInboxLines: 1000 }),
   /**
    * Auxiliary LLM route and per-call budget, shared by `capture.useLlm` and
-   * the Dream LLM passes. Empty provider/model = the route declared on the
-   * plugin composition row (shipped default: deepseek / deepseek-v4-flash).
+   * the Dream LLM passes. Resolution per field, first non-empty wins:
+   * (1) these explicit overrides, (2) the CURRENT SESSION's default model
+   * (live `agent-default-model` settings — the model this agent runs on),
+   * (3) the composition-row route as a last resort.
    */
   llm: z
     .object({
-      /** Provider route override (empty = composition route). */
+      /** Provider route override (empty = session model → composition route). */
       provider: z.string().max(128).default(''),
-      /** Model id override (empty = composition route). */
+      /** Model id override (empty = session model → composition route). */
       model: z.string().max(128).default(''),
       /** Max output tokens per auxiliary call. */
       maxOutputTokens: z.natural().min(16).max(4000).default(600),
-      /** Per-call deadline (ms). */
-      timeoutMs: z.natural().min(1000).max(120000).default(30000),
+      /** Per-call deadline (ms). 60s: session-model calls on long tails can
+       *  exceed 30s on 27B-class models (field-observed 'skipped timeout'). */
+      timeoutMs: z.natural().min(1000).max(120000).default(60000),
     })
-    .default({ provider: '', model: '', maxOutputTokens: 600, timeoutMs: 30000 }),
+    .default({ provider: '', model: '', maxOutputTokens: 600, timeoutMs: 60000 }),
 });
 
 export type MemorySettings = Schemastery.TypeT<typeof MemorySettingsSchema>;
@@ -93,6 +96,6 @@ export function defaultMemorySettings(): MemorySettings {
     dream: { enabled: true, useLlm: true, intervalMinutes: 30, maxLlmCalls: 40, maxWallMs: 600000, requestSeq: 0 },
     brief: { enabled: true, maxBytes: 4096, projectK: 12, globalK: 8 },
     budget: { maxCardBytes: 4096, maxInboxLines: 1000 },
-    llm: { provider: '', model: '', maxOutputTokens: 600, timeoutMs: 30000 },
+    llm: { provider: '', model: '', maxOutputTokens: 600, timeoutMs: 60000 },
   };
 }

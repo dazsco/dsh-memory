@@ -9,8 +9,9 @@
 - insert:
     - id: dsh-memory
       name: 'dsh-memory'
-      # Default auxiliary LLM route for capture/Dream passes. Users override
-      # per-instance with memory.llm.provider / memory.llm.model settings.
+      # Last-resort auxiliary LLM route for capture/Dream passes. Resolution
+      # per field, first non-empty wins: memory.llm.* settings → the current
+      # session's default model (agent-default-model) → this row.
       llm:
         provider: deepseek
         model: deepseek-v4-flash
