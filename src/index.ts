@@ -117,7 +117,7 @@ export function apply(ctx: Context, config?: MemoryPluginConfig | null): void {
         // existed simply lack it — the schema default does not backfill
         // nested sections on every reader, so keep a local fallback.
         const st = getSettings();
-        const l = st.llm ?? { provider: '', model: '', maxOutputTokens: 600, timeoutMs: 30000 };
+        const l = st.llm ?? { provider: '', model: '', maxOutputTokens: 2000, timeoutMs: 60000 };
         let provider = l.provider;
         let model = l.model;
         if (provider === '' || model === '') {

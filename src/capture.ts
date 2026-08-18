@@ -196,7 +196,7 @@ export function registerCapture(
           ts: new Date().toISOString(),
           store: targetStore.slug,
           op: 'llm',
-          detail: pass.status === 'ok' ? `ok n=${llmLines.length}` : `${pass.status}${pass.reason ? ` ${pass.reason}` : ''}`.slice(0, 160),
+          detail: pass.status === 'ok' ? `ok n=${llmLines.length}${pass.truncated ? ' truncated' : ''}` : `${pass.status}${pass.reason ? ` ${pass.reason}` : ''}`.slice(0, 160),
           via: 'auto',
           session: sess.id,
         })
@@ -243,6 +243,8 @@ export interface LlmPassResult {
   /** 'ok' | 'skipped' (no service / unregistered / call failed) | 'error' (threw). */
   status: 'ok' | 'skipped' | 'error';
   reason?: string;
+  /** The reply was cut off at the output budget; lines were salvaged. */
+  truncated?: boolean;
 }
 
 /**
@@ -269,7 +271,11 @@ async function runLlmPass(
       );
       return { lines: [], status: 'skipped', reason: result.reason };
     }
-    return { lines: parseLlmMemoryLines(result.text).slice(0, MAX_CANDIDATES), status: 'ok' };
+    return {
+      lines: parseLlmMemoryLines(result.text).slice(0, MAX_CANDIDATES),
+      status: 'ok',
+      truncated: result.truncated === true,
+    };
   } catch (err) {
     llmDeps.logger?.warn?.(
       `[dsh-memory] capture LLM pass failed: ${err instanceof Error ? err.message : String(err)}`,

@@ -143,14 +143,20 @@ test('callMemoryLlm: error finish becomes a failure', async () => {
   assert.match(r.message, /boom/);
 });
 
-test('callMemoryLlm: max-tokens finish is a distinct failure', async () => {
+test('callMemoryLlm: max-tokens finish salvages the partial text', async () => {
+  const partial = '第一条记忆行：团队约定用 pnpm。\n第二条记忆行被截';
   const deps = {
     ...baseDeps,
-    llm: fakeLlm(() => textChunks('partial', { kind: 'max-tokens' })),
+    llm: fakeLlm(() => textChunks(partial, { kind: 'max-tokens' })),
   };
   const r = await T.callMemoryLlm(deps, { system: 's', user: 'u' });
-  assert.equal(r.ok, false);
-  assert.equal(r.reason, 'max-tokens');
+  assert.equal(r.ok, true, 'truncated reply is salvageable, not a failure');
+  assert.equal(r.truncated, true);
+  assert.equal(r.text, partial);
+  // The salvage path keeps producing parseable candidate lines.
+  const lines = T.parseLlmMemoryLines(r.text);
+  assert.ok(lines.length >= 1, 'at least the complete leading line is recovered');
+  assert.match(lines[0], /pnpm/);
 });
 
 test('callMemoryLlm: deadline abort maps to timeout', async () => {

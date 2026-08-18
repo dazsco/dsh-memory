@@ -46,7 +46,7 @@ export interface MemoryLlmDeps {
 export type LlmFailReason = 'no-service' | 'no-route' | 'unregistered' | 'timeout' | 'aborted' | 'max-tokens' | 'error';
 
 export type LlmResult =
-  | { ok: true; text: string; route: { provider: string; model: string } }
+  | { ok: true; text: string; route: { provider: string; model: string }; truncated?: boolean }
   | { ok: false; reason: LlmFailReason; message?: string };
 
 export interface MemoryLlmRequest {
@@ -111,8 +111,18 @@ export async function callMemoryLlm(deps: MemoryLlmDeps, request: MemoryLlmReque
         const timedOut = timeoutOf(callDeadline.signal, TIMEOUT_CODE) !== undefined;
         return { ok: false, reason: timedOut ? 'timeout' : 'aborted', message: finish.failure?.message };
       }
-      case 'max-tokens':
-        return { ok: false, reason: 'max-tokens' };
+      case 'max-tokens': {
+        // The reply was cut off at the output budget, but the text produced
+        // so far usually still holds complete, parseable memory lines (the
+        // model writes them top-down). Salvage those instead of discarding
+        // the whole call — a truncated last line is cheaper than zero.
+        const partial = assembler
+          .blocks()
+          .filter((b) => b.type === 'text')
+          .map((b) => b.text)
+          .join('');
+        return { ok: true, text: partial, route: { provider, model }, truncated: true };
+      }
       case 'tool-calls':
         return { ok: false, reason: 'error', message: 'model requested a tool; refused' };
       case 'error':

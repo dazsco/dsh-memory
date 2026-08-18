@@ -76,13 +76,14 @@ export const MemorySettingsSchema = z.object({
       provider: z.string().max(128).default(''),
       /** Model id override (empty = session model → composition route). */
       model: z.string().max(128).default(''),
-      /** Max output tokens per auxiliary call. */
-      maxOutputTokens: z.natural().min(16).max(4000).default(600),
+      /** Max output tokens per auxiliary call. 2000: field-measured
+       *  extraction replies on 27B-class models run 1400–2100 tokens. */
+      maxOutputTokens: z.natural().min(16).max(8000).default(2000),
       /** Per-call deadline (ms). 60s: session-model calls on long tails can
        *  exceed 30s on 27B-class models (field-observed 'skipped timeout'). */
       timeoutMs: z.natural().min(1000).max(120000).default(60000),
     })
-    .default({ provider: '', model: '', maxOutputTokens: 600, timeoutMs: 60000 }),
+    .default({ provider: '', model: '', maxOutputTokens: 2000, timeoutMs: 60000 }),
 });
 
 export type MemorySettings = Schemastery.TypeT<typeof MemorySettingsSchema>;
@@ -96,6 +97,6 @@ export function defaultMemorySettings(): MemorySettings {
     dream: { enabled: true, useLlm: true, intervalMinutes: 30, maxLlmCalls: 40, maxWallMs: 600000, requestSeq: 0 },
     brief: { enabled: true, maxBytes: 4096, projectK: 12, globalK: 8 },
     budget: { maxCardBytes: 4096, maxInboxLines: 1000 },
-    llm: { provider: '', model: '', maxOutputTokens: 600, timeoutMs: 60000 },
+    llm: { provider: '', model: '', maxOutputTokens: 2000, timeoutMs: 60000 },
   };
 }
