@@ -58,6 +58,23 @@ test('parseConflictDecisions: valid a/b/both, malformed skipped', () => {
   assert.equal(d.get(0), 'b', 'first decision for a group wins');
 });
 
+test('parseConflictDecisions: tolerant of live-model format drift', () => {
+  const full = [
+    { a: { id: 'm-20260818-1e496c5f28', kind: 'fact', title: 'A', body: 'a', importance: 5 }, b: { id: 'm-20260818-34956a94b9', kind: 'fact', title: 'B', body: 'b', importance: 5 }, similarity: 0.4 },
+    { a: { id: 'm-20260818-0a5170c523', kind: 'fact', title: 'C', body: 'c', importance: 5 }, b: { id: 'm-20260818-b4dacbb0e1', kind: 'fact', title: 'D', body: 'd', importance: 5 }, similarity: 0.3 },
+    { a: { id: 'm-20260818-cafef00d11', kind: 'fact', title: 'E', body: 'e', importance: 5 }, b: { id: 'm-20260818-deadbeef22', kind: 'fact', title: 'F', body: 'f', importance: 5 }, similarity: 0.35 },
+  ];
+  // prefix-less suffix id / colon + trailing punctuation / bare A letter
+  const d = T.parseConflictDecisions('G1 1e496c5f28\nG2: b4dacbb0e1.\nG3 A', full);
+  assert.equal(d.get(0), 'a', 'suffix id keeps A');
+  assert.equal(d.get(1), 'b', 'colon + trailing dot still parses to B');
+  assert.equal(d.get(2), 'a', 'bare A letter keeps A');
+  // junk shorter than 8 chars must not alias any id
+  const junk = T.parseConflictDecisions('G1 1e496c5\nG2 both', full);
+  assert.equal(junk.has(0), false, '7-char junk does not match');
+  assert.equal(junk.get(1), 'both');
+});
+
 // ── callMemoryLlm (fake service, real assembler) ─────────────────────────────
 
 function textChunks(text, finish = { kind: 'stop' }) {

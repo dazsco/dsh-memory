@@ -462,7 +462,11 @@ export class DreamEngine {
     });
     const summary = text === null ? null : parseSummaryText(text);
     if (summary === null) {
-      res.notes.push('llm-summarize: no overview produced');
+      res.notes.push(
+        text === null
+          ? 'llm-summarize: no reply (budget or failure)'
+          : `llm-summarize: unparseable reply: ${JSON.stringify(text.slice(0, 160))}`,
+      );
       return;
     }
     const md = `# Memory overview — ${store.slug}\n\nUpdated: ${new Date().toISOString()}\n\n${summary}\n`;
@@ -516,6 +520,14 @@ export class DreamEngine {
       return;
     }
     const decisions = parseConflictDecisions(text, conflictPairs);
+    // Observability: the report is the only record of what the model decided.
+    // Without this line a format drift stays invisible forever (see 2026-08-18
+    // tanke run: pairs sent, replies parsed to zero decisions, no note).
+    res.notes.push(
+      `llm-conflict: ${conflictPairs.length} pair(s) → ${
+        [...decisions.entries()].sort((x, y) => x[0] - y[0]).map(([i, dd]) => `G${i + 1}=${dd}`).join(' ') || 'no decision'
+      } | reply=${JSON.stringify(text.slice(0, 240))}`,
+    );
     for (const [idx, d] of decisions) {
       const pair = pairs[idx];
       if (pair === undefined || d === 'both') continue;

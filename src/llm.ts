@@ -246,11 +246,14 @@ export function parseSummaryText(text: string, maxChars = 800): string | null {
 
 export const DREAM_CONFLICT_SYSTEM = [
   '下面给出几组近似重复的记忆卡片（组号 G1、G2...，每组 A/B 两条）。',
-  '判断每组应保留哪一条：内容相同的保留更完整/更新的一条；互补的都可保留。',
+  '判断每组应保留哪一条：内容相同（或一条包含另一条）的保留更完整/更新的一条；互补的都可保留。',
   '每组输出恰好一行，格式：G<编号> <保留的id>  或  G<编号> both',
+  '保留的 id 必须逐字使用题目中给出的完整 id（以 m- 开头），不要缩写或改写。',
+  '示例：G1 m-20260818-1a2b3c4d5e',
   '只输出这些行，不要任何解释或多余文字。',
   'Below are groups of near-duplicate memory cards. For each group output exactly one line:',
-  'G<number> <kept-id>   or   G<number> both. Output nothing else.',
+  'G<number> <kept-id>   or   G<number> both. The kept-id must be the full id (m-...) given in the prompt.',
+  'Example: G1 m-20260818-1a2b3c4d5e. Output nothing else.',
 ].join('\n');
 
 export interface ConflictPair {
@@ -278,7 +281,7 @@ export type ConflictDecision = 'a' | 'b' | 'both';
 export function parseConflictDecisions(text: string, pairs: ConflictPair[]): Map<number, ConflictDecision> {
   const out = new Map<number, ConflictDecision>();
   for (const raw of text.split(/\r?\n/)) {
-    const m = /^G(\d+)\s+(\S+)/.exec(raw.trim());
+    const m = /^G(\d+)\s*:?\s*(\S+)/.exec(raw.trim());
     if (!m) continue;
     const idx = Number(m[1]) - 1;
     const pair = pairs[idx];
@@ -289,6 +292,16 @@ export function parseConflictDecisions(text: string, pairs: ConflictPair[]): Map
     if (/^both$/i.test(val)) d = 'both';
     else if (val === pair.a.id) d = 'a';
     else if (val === pair.b.id) d = 'b';
+    // Tolerate live-model format drift: A/B letters, colon separators, and
+    // id variants (dropped m-YYYYMMDD- prefix, trailing punctuation). A
+    // suffix match only counts at ≥8 chars so junk can't alias a card.
+    else if (/^a$/i.test(val)) d = 'a';
+    else if (/^b$/i.test(val)) d = 'b';
+    else {
+      const bare = val.replace(/[.,;:!?，。；：！？]+$/g, '');
+      if (bare.length >= 8 && (pair.a.id.endsWith(bare) || bare.endsWith(pair.a.id))) d = 'a';
+      else if (bare.length >= 8 && (pair.b.id.endsWith(bare) || bare.endsWith(pair.b.id))) d = 'b';
+    }
     if (d !== null && !out.has(idx)) out.set(idx, d);
   }
   return out;
