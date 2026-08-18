@@ -27,7 +27,7 @@ import type { MemoryCore } from './core.ts';
 import { MemoryStore } from './store.ts';
 import { gateCandidate } from './redact.ts';
 import { cardStrength, jaccard, tokenize } from './retrieval.ts';
-import { dedupDecide } from './dedup.ts';
+import { dedupDecide, normalizeMemoryText } from './dedup.ts';
 import { makeCardId } from './cards.ts';
 import { listFiles } from './fsutil.ts';
 import type { DreamState, InboxEntry, MemoryCard, MemoryKind } from './types.ts';
@@ -269,6 +269,7 @@ export class DreamEngine {
           }
           const ts = nowIso();
           const kind: MemoryKind = entry.kind && MEMORY_KINDS_LOCAL.has(entry.kind) ? entry.kind : 'fact';
+          const normText = normalizeMemoryText(gated.text);
           const card: MemoryCard = {
             id: makeCardId(now()),
             kind,
@@ -284,8 +285,8 @@ export class DreamEngine {
             supersedes: [],
             source: entry.source ?? { session: '', turn: null },
             links: [],
-            title: firstLine(gated.text),
-            body: gated.text,
+            title: firstLine(normText),
+            body: normText,
           };
           await store.putCard(card);
           await store.audit({ ts, store: store.slug, op: 'create', id: card.id, detail: card.title.slice(0, 80), via: 'dream', session: entry.source?.session });

@@ -32,7 +32,7 @@ import {
   rankWithMmr,
   tokenize,
 } from './retrieval.ts';
-import { dedupDecide } from './dedup.ts';
+import { dedupDecide, normalizeMemoryText } from './dedup.ts';
 import {
   MEMORY_SCHEMA_VERSION,
   MEMORY_KINDS,
@@ -195,7 +195,7 @@ export class MemoryCore {
       }
     }
 
-    const content = String(input.content ?? '').trim();
+    const content = normalizeMemoryText(String(input.content ?? '').trim());
     if (!content) throw new Error('memory content is empty');
     const maxBytes = input.maxBytes ?? 4096;
     if (Buffer.byteLength(content, 'utf8') > maxBytes) {

@@ -124,7 +124,9 @@ export type AuditOp =
   | 'promote'
   | 'dream'
   | 'forget'
-  | 'hard-delete';
+  | 'hard-delete'
+  | /** Auxiliary LLM path outcome for one turn capture (ok/skipped/error). */
+  'llm';
 
 export type AuditVia = 'tool' | 'auto' | 'auto-heuristic' | 'auto-llm' | 'dream' | 'dream-llm' | 'user' | 'client' | 'system';
 

@@ -40,6 +40,25 @@ export function dedupDecide(
 }
 
 /**
+ * Normalize captured memory text: collapse whitespace runs per line and drop
+ * exact-duplicate lines (case-insensitive) that accumulate when the same
+ * sentence is staged more than once before Dream runs.
+ */
+export function normalizeMemoryText(text: string): string {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\s+/g, ' ').trim();
+    if (!line) continue;
+    const key = line.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+/**
  * Promotion gate: a project card is eligible for a global copy when its
  * confidence is high AND it was corroborated by at least `minSessions`
  * distinct source sessions (or a rule says otherwise).

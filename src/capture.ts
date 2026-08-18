@@ -31,7 +31,11 @@ import {
 export interface SessionLike {
   id: string;
   header?: { cwd?: string; delegationDepth?: number } | null;
-  deriveMessages?(): Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
+  deriveMessages?(): Array<{
+    role: string;
+    content: Array<{ type: string; text?: string }>;
+    source?: { kind?: string; plugin?: string } | null;
+  }>;
 }
 
 export interface IntentCandidate {
@@ -41,7 +45,7 @@ export interface IntentCandidate {
 
 /** Explicit "remember this" intent — deliberately narrow (precision > recall). */
 const INTENT_RE =
-  /(记住|记一下|记下来|记到|别忘了|别忘|忘掉以前.*(改用|换成)|以后(都要|都得|必须|不要|别再|还是)|下次(记得|要|再|都)|长期(用|都)|统一(用|用)|永远(都|要)|默认(用|是)|always remember|remember that|remember to|from now on|going forward|always use|never use|stop using|switch to|my preference)/i;
+  /(记住|记一下|记下来|记到|别忘了|别忘|忘掉以前.*(改用|换成)|以后(都要|都得|必须|不要|别再|还是)|下次(记得|要|再|都)|长期(用|都)|统一(用|用)|永远(都|要)|默认(用|是)|always remember|\bremember that\b|\bremember to\b|from now on|going forward|always use|never use|stop using|my preference)/i;
 
 /** Preference-shaped intent (kind classification). */
 const PREFERENCE_RE = /(偏好|习惯|prefer|always|from now on|going forward|统一|固定|永远|默认|总是|始终)/i;
@@ -49,6 +53,20 @@ const PREFERENCE_RE = /(偏好|习惯|prefer|always|from now on|going forward|�
 const MIN_SENT = 6;
 const MAX_SENT = 400;
 const MAX_CANDIDATES = 5;
+
+/**
+ * Remove machine-injected `<system-reminder>` blocks (memory brief, skill
+ * catalog, runtime context). Their boilerplate is never a user statement and
+ * must not become a memory candidate.
+ */
+export function stripSystemReminders(text: string): string {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
+}
+
+/** True for messages dsh-memory itself injected (the session-start brief). */
+function isPluginInjected(source: { kind?: string; plugin?: string } | null | undefined): boolean {
+  return source?.kind === 'plugin' && source?.plugin === 'dsh-memory';
+}
 
 /** Split text into sentences (CJK + latin terminators). */
 export function splitSentences(text: string): string[] {
@@ -132,10 +150,15 @@ export function registerCapture(
       const m = messages[i];
       if (m === undefined) continue;
       if (m.role !== 'user' && m.role !== 'assistant') continue;
-      const text = (m.content ?? [])
-        .filter((b) => b.type === 'text' && typeof b.text === 'string')
-        .map((b) => b.text as string)
-        .join(' ');
+      // Skip messages dsh-memory injected itself (the session-start brief):
+      // machine context is never a user memory statement.
+      if (isPluginInjected(m.source)) continue;
+      const text = stripSystemReminders(
+        (m.content ?? [])
+          .filter((b) => b.type === 'text' && typeof b.text === 'string')
+          .map((b) => b.text as string)
+          .join(' '),
+      ).trim();
       if (text) tail = `${text}\n${tail}`;
     }
     tail = tail.slice(0, s.capture.turnTailChars);
@@ -144,7 +167,24 @@ export function registerCapture(
     const candidates = extractIntentSentences(tail);
     const cwd = sess.header?.cwd;
     const project = cwd ? await core.projectStoreForCwd(cwd).catch(() => null) : null;
-    const llmLines = s.capture.useLlm && llmDeps !== null ? await runLlmPass(tail, candidates, llmDeps) : [];
+    const targetStore = project ?? core.global;
+    let llmLines: string[] = [];
+    if (s.capture.useLlm && llmDeps !== null) {
+      const pass = await runLlmPass(tail, candidates, llmDeps);
+      llmLines = pass.lines;
+      // Audit trail so the auxiliary-call path is observable (ok / skipped /
+      // error) — previously a silent skip left no trace at all.
+      await targetStore
+        .audit({
+          ts: new Date().toISOString(),
+          store: targetStore.slug,
+          op: 'llm',
+          detail: pass.status === 'ok' ? `ok n=${llmLines.length}` : `${pass.status}${pass.reason ? ` ${pass.reason}` : ''}`.slice(0, 160),
+          via: 'auto',
+          session: sess.id,
+        })
+        .catch(() => undefined);
+    }
     if (candidates.length === 0 && llmLines.length === 0) return;
 
     const stage = (content: string, kind: MemoryKind, via: AuditVia) => {
@@ -180,18 +220,26 @@ export function registerCapture(
   }
 }
 
+/** Outcome of one capture LLM pass (for the observability audit). */
+export interface LlmPassResult {
+  lines: string[];
+  /** 'ok' | 'skipped' (no service / unregistered / call failed) | 'error' (threw). */
+  status: 'ok' | 'skipped' | 'error';
+  reason?: string;
+}
+
 /**
  * One budgeted LLM extraction call for this turn. Returns the parsed,
- * length-capped candidate lines; any failure (service, route, timeout,
- * provider error) is a warning and yields [] — the heuristic pass is
- * unaffected.
+ * length-capped candidate lines plus a status for the audit trail; any
+ * failure (service, route, timeout, provider error) is a warning and yields
+ * [] — the heuristic pass is unaffected.
  */
 async function runLlmPass(
   tail: string,
   heuristic: IntentCandidate[],
   llmDeps: MemoryLlmDeps,
-): Promise<string[]> {
-  if (llmDeps.llm === null) return [];
+): Promise<LlmPassResult> {
+  if (llmDeps.llm === null) return { lines: [], status: 'skipped', reason: 'no-llm-service' };
   try {
     const known = heuristic.map((c) => c.content);
     const result = await callMemoryLlm(llmDeps, {
@@ -202,13 +250,13 @@ async function runLlmPass(
       llmDeps.logger?.warn?.(
         `[dsh-memory] capture LLM skipped (${result.reason}${result.message ? `: ${result.message}` : ''}); heuristic path unaffected`,
       );
-      return [];
+      return { lines: [], status: 'skipped', reason: result.reason };
     }
-    return parseLlmMemoryLines(result.text).slice(0, MAX_CANDIDATES);
+    return { lines: parseLlmMemoryLines(result.text).slice(0, MAX_CANDIDATES), status: 'ok' };
   } catch (err) {
     llmDeps.logger?.warn?.(
       `[dsh-memory] capture LLM pass failed: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return [];
+    return { lines: [], status: 'error', reason: err instanceof Error ? err.message : String(err) };
   }
 }

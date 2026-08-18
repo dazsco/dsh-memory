@@ -19,7 +19,7 @@ export type { MemoryRules } from './rules.ts';
 export { tokenize, jaccard, bm25Score, cardRecency, cardStrength, compositeScore, rankWithMmr, makeSnippet } from './retrieval.ts';
 export type { ScoredCandidate } from './retrieval.ts';
 
-export { dedupDecide, promotionEligible, DEDUP_THRESHOLDS } from './dedup.ts';
+export { dedupDecide, normalizeMemoryText, promotionEligible, DEDUP_THRESHOLDS } from './dedup.ts';
 export type { DedupDecision, DedupAction } from './dedup.ts';
 
 export {
@@ -55,7 +55,7 @@ export type { BriefOptions } from './brief.ts';
 export { DreamEngine, registerDream } from './dream.ts';
 export type { DreamLlm, DreamRunOptions, StoreDreamResult, DreamRunResult } from './dream.ts';
 
-export { registerCapture, extractIntentSentences, splitSentences } from './capture.ts';
+export { registerCapture, extractIntentSentences, splitSentences, stripSystemReminders } from './capture.ts';
 export type { SessionLike, IntentCandidate } from './capture.ts';
 
 export {
