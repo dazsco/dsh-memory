@@ -12,6 +12,7 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { withFileLock } from '@deepseek-ai/dsh-atomic-write';
+import { healOrphanLock, isLockTimeout } from './lockheal.ts';
 import type {
   AuditEntry,
   CardMeta,
@@ -73,6 +74,28 @@ export class MemoryStore {
     await ensureDir(this.paths.dream);
   }
 
+  /**
+   * Run `op` under a writer lock with orphan recovery: on a lock timeout,
+   * if the blocking lock belongs to a dead process (provably orphaned),
+   * remove it and retry once. A lock held by a live process still times
+   * out as before (no stealing).
+   */
+  private async lockedOn<T>(lockBase: string, op: () => Promise<T>): Promise<T> {
+    try {
+      return await withFileLock(lockBase, op);
+    } catch (err) {
+      if (isLockTimeout(err) && (await healOrphanLock(`${lockBase}.lock`))) {
+        return await withFileLock(lockBase, op);
+      }
+      throw err;
+    }
+  }
+
+  /** Store-card writes: the per-store lock with orphan recovery. */
+  private locked<T>(op: () => Promise<T>): Promise<T> {
+    return this.lockedOn(this.paths.lock, op);
+  }
+
   // ── index ────────────────────────────────────────────────────────────────
 
   /** Read the index, rebuilding it when missing (cached by mtime). */
@@ -104,7 +127,7 @@ export class MemoryStore {
 
   /** Rebuild index.json from the card files (under the store lock). */
   async rebuildIndex(): Promise<MemoryIndex> {
-    return await withFileLock(this.paths.lock, async () => {
+    return await this.locked(async () => {
       const names = await listFiles(this.paths.cards);
       const cards: Record<string, CardMeta> = {};
       const df: Record<string, number> = {};
@@ -176,7 +199,7 @@ export class MemoryStore {
 
   /** Atomically write one card and refresh the index. */
   async putCard(card: MemoryCard): Promise<void> {
-    await withFileLock(this.paths.lock, async () => {
+    await this.locked(async () => {
       await writeCardFile(this.paths.cards, card);
     });
     await this.rebuildIndex();
@@ -199,7 +222,7 @@ export class MemoryStore {
       >
     >,
   ): Promise<MemoryCard | null> {
-    const card = await withFileLock(this.paths.lock, async () => {
+    const card = await this.locked(async () => {
       const existing = await readCardFile(this.paths.cards, id);
       if (existing === null) return null;
       Object.assign(existing, patch);
@@ -213,7 +236,7 @@ export class MemoryStore {
 
   /** Move a card to archive/ (keeps the file, removes it from the index). */
   async archiveCard(id: string): Promise<boolean> {
-    return await withFileLock(this.paths.lock, async () => {
+    return await this.locked(async () => {
       const src = join(this.paths.cards, `${id}.md`);
       const text = await readTextSafe(src);
       if (text === null) return false;
@@ -226,7 +249,7 @@ export class MemoryStore {
   }
 
   async deleteCardHard(id: string): Promise<boolean> {
-    const deleted = await withFileLock(this.paths.lock, async () => {
+    const deleted = await this.locked(async () => {
       const src = join(this.paths.cards, `${id}.md`);
       try {
         await fs.unlink(src);
@@ -272,7 +295,7 @@ export class MemoryStore {
 
   /** Truncate the access log (Dream consumes it). */
   async clearAccessLog(): Promise<void> {
-    await withFileLock(this.paths.access, () => fs.writeFile(this.paths.access, '', 'utf8'));
+    await this.lockedOn(this.paths.access, () => fs.writeFile(this.paths.access, '', 'utf8'));
   }
 
   // ── dream state ──────────────────────────────────────────────────────────

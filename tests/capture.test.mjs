@@ -46,6 +46,27 @@ test('genuine intents still match (CJK + latin)', () => {
   assert.equal(fromNow.length, 1);
 });
 
+test('negated remember-intents are NOT captured', () => {
+  // The observed leak: user said "不需要记住" and the whole sentence was captured.
+  assert.equal(extractIntentSentences('他们是瞬态的，不需要记住。').length, 0);
+  assert.equal(extractIntentSentences('这种临时结论不用记下来。').length, 0);
+  assert.equal(extractIntentSentences('过程细节不要记住，只要结果。').length, 0);
+  assert.equal(extractIntentSentences('无需记录这次命令的输出数量。').length, 0);
+});
+
+test('positive intents adjacent to negated ones still match', () => {
+  // "以后都不要用 webpack" is a genuine (negative-form) preference, not a negation of remembering.
+  const out = extractIntentSentences('以后都不要用 webpack 了，统一用 vite。');
+  assert.equal(out.length, 1);
+  // "别忘" stays positive.
+  const dontForget = extractIntentSentences('别忘了提交前跑 typecheck。');
+  assert.equal(dontForget.length, 1);
+  // A negated clause plus a genuine intent in the same sentence → still captured.
+  const mixed = extractIntentSentences('调试过程不用记下来，但记住:注释统一用中文。');
+  assert.equal(mixed.length, 1);
+  assert.match(mixed[0].content, /注释统一用中文/);
+});
+
 test('normalizeMemoryText drops exact-duplicate lines (case-insensitive)', () => {
   const out = normalizeMemoryText('line one\n\nline one\n  LINE ONE  \nline two');
   assert.equal(out, 'line one\nline two');

@@ -93,9 +93,32 @@ export async function callMemoryLlm(deps: MemoryLlmDeps, request: MemoryLlmReque
       signal: callDeadline.signal,
     });
     const assembler = new BlockAssembler();
-    for await (const chunk of llm.stream(options)) {
+    const stream = llm.stream(options);
+    let streamDone = false;
+    // A stalled stream (no chunks and no close — observed on the flaky
+    // ztu-ai endpoint) would suspend the for-await forever even after the
+    // deadline aborts the signal, because throwIfAborted only runs when a
+    // chunk arrives. Race the drain against the deadline so this call is
+    // always bounded by live.timeoutMs.
+    await Promise.race([
+      (async () => {
+        for await (const chunk of stream) {
+          callDeadline.signal.throwIfAborted();
+          assembler.push(chunk);
+        }
+        streamDone = true;
+      })(),
+      new Promise<void>((resolve) => {
+        if (callDeadline.signal.aborted) return resolve();
+        callDeadline.signal.addEventListener('abort', () => resolve(), { once: true });
+      }),
+    ]);
+    if (!streamDone) {
+      // The deadline won: best-effort cancel of the stalled stream (not
+      // awaited — cancelling may itself hang on the dead socket; the call is
+      // already bounded) and report the coded timeout via the existing catch.
+      void stream[Symbol.asyncIterator]().return?.().catch(() => undefined);
       callDeadline.signal.throwIfAborted();
-      assembler.push(chunk);
     }
     const finish = assembler.finish;
     switch (finish.kind) {
@@ -188,18 +211,44 @@ export function classifyLlmLine(line: string): 'fact' | 'preference' {
   return PREFERENCE_RE.test(line) ? 'preference' : 'fact';
 }
 
-/** The extraction system prompt (bilingual, output contract is line-based). */
-export const CAPTURE_LLM_SYSTEM = [
-  '你是记忆抽取助手。从给定的对话尾部中抽取值得长期记住的信息。',
-  'You are a memory extractor. Pull durable memories from the conversation tail below.',
-  'Rules / 规则:',
-  '- Only output what is durable: stable facts, user preferences, decisions, procedures, commitments, project conventions.',
-  '- 只输出值得长期记住的内容：稳定事实、用户偏好、决定、流程、承诺、项目约定。',
-  '- One memory per line; plain text; no JSON, no markdown markers, no explanations.',
-  '- Never output secrets (keys, tokens, passwords) — skip any line containing one.',
-  '- Never invent; if nothing is worth remembering, output exactly: NONE',
-  '- 不要编造；如果没有值得记住的，只输出：NONE',
-].join('\n');
+/**
+ * The extraction system prompt (bilingual, line-based output contract).
+ * Scope-aware: a GLOBAL target gets strict user-level-only discipline (this
+ * is where project facts, one-off data and meta chatter have leaked into),
+ * a project target may take project facts but never meta/transient content.
+ */
+export type CaptureTarget = { kind: 'global' } | { kind: 'project'; slug: string };
+
+export function captureSystemPrompt(target: CaptureTarget): string {
+  const rules = [
+    '你是记忆抽取助手。从给定的对话尾部中抽取值得长期记住的信息。',
+    'You are a memory extractor. Pull durable memories from the conversation tail below.',
+    'Rules / 规则:',
+    '- Only output what is durable: stable facts, user preferences, decisions, procedures, commitments, project conventions.',
+    '- 只输出值得长期记住的内容：稳定事实、用户偏好、决定、流程、承诺、项目约定。',
+    '- One memory per line; plain text; no JSON, no markdown markers, no explanations.',
+    '- Never output secrets (keys, tokens, passwords) — skip any line containing one.',
+    '- Never invent; if nothing is worth remembering, output exactly: NONE',
+    '- 不要编造；如果没有值得记住的，只输出：NONE',
+    // Universal exclusions (both scopes) — the three observed leak classes:
+    '- Never output anything about the memory system itself, the AI assistant, or the conversation itself (meta content). / 永不输出关于记忆系统本身、AI 助手或本次对话的内容（元内容一律不记）。',
+    '- Never output one-off command outputs (a single command\'s counts, sizes, versions) or task artifact paths/sizes. / 不要输出一次性命令输出（某次命令的数量/大小/版本）或任务产物的路径/尺寸。',
+    '- Each line must be a distilled durable statement, never a verbatim fragment of the conversation. / 每行必须是提炼后的持久陈述，绝不能照抄对话原文片段。',
+  ];
+  if (target.kind === 'global') {
+    rules.push(
+      'Target store: GLOBAL user-level memory (cross-project, cross-machine). / 目标库：全局用户级记忆（跨项目、跨机器）。',
+      '- Output ONLY user-level content: the user\'s own working preferences and decisions, environment/tooling facts about the user\'s machine, cross-project procedures.',
+      '- Do NOT output facts about any specific project (its code, file paths, commits, test counts, repo layout, task details). If the conversation is mainly about a specific project, output exactly: NONE',
+      '- 只输出用户级内容：用户自己的工作偏好/决定、其机器上的环境与工具链事实、跨项目流程。任何特定项目的事实（代码/路径/提交/测试数/仓库结构/任务细节）都不要输出；对话主要在谈某个具体项目时，只输出 NONE。',
+    );
+  } else {
+    rules.push(
+      `Target store: project memory for "${target.slug}" — its code, conventions, commits and test facts are in scope. / 目标库：项目 "${target.slug}" 的记忆库，该项目的代码/约定/提交/测试事实可以输出。`,
+    );
+  }
+  return rules.join('\n');
+}
 
 /**
  * Build the extraction user prompt. `known` are the heuristic candidates

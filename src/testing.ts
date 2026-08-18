@@ -43,6 +43,8 @@ export type { ProjectEntry, ProjectsRegistry } from './paths.ts';
 export { MemoryStore } from './store.ts';
 export type { StoreLogger } from './store.ts';
 
+export { healOrphanLock, isLockTimeout } from './lockheal.ts';
+
 export { MemoryCore, normalizeTags } from './core.ts';
 export type { RememberInput, RecallOptions, ForgetResult } from './core.ts';
 
@@ -62,7 +64,7 @@ export {
   callMemoryLlm,
   parseLlmMemoryLines,
   classifyLlmLine,
-  CAPTURE_LLM_SYSTEM,
+  captureSystemPrompt,
   buildCaptureLlmUserPrompt,
   DREAM_SUMMARIZE_SYSTEM,
   buildSummarizeUserPrompt,

@@ -196,6 +196,34 @@ test('callMemoryLlm: deadline abort maps to timeout', async () => {
   assert.equal(r.reason, 'timeout');
 });
 
+test('callMemoryLlm: stalled stream (no chunks, no close, signal ignored) is still bounded', async () => {
+  // The observed production failure: the ztu-ai endpoint dropped mid-stream;
+  // the for-await then suspended forever because throwIfAborted only runs
+  // when a chunk arrives. The drain must race against the deadline.
+  const started = Date.now();
+  const deps = {
+    ...baseDeps,
+    route: () => ({ provider: 'deepseek', model: 'deepseek-v4-flash', maxOutputTokens: 100, timeoutMs: 40 }),
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      stream() {
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              next: () => new Promise(() => {}), // never resolves: no chunks, no close
+              return: () => Promise.resolve({ done: true, value: undefined }),
+            };
+          },
+        };
+      },
+    },
+  };
+  const r = await T.callMemoryLlm(deps, { system: 's', user: 'u' });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'timeout');
+  assert.ok(Date.now() - started < 2000, `stalled stream must be bounded by the deadline, took ${Date.now() - started}ms`);
+});
+
 test('callMemoryLlm: per-request maxOutputTokens override wins', async () => {
   let seen = null;
   const deps = {

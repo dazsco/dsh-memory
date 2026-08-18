@@ -22,6 +22,7 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { writeFileAtomic, withFileLock } from '@deepseek-ai/dsh-atomic-write';
+import { healOrphanLock, isLockTimeout } from './lockheal.ts';
 import type { StoreLogger } from './store.ts';
 import type { MemoryCore } from './core.ts';
 import { MemoryStore } from './store.ts';
@@ -218,8 +219,23 @@ export class DreamEngine {
       notes: [],
     };
     const nowIso = () => now().toISOString();
+    const runLockBase = join(store.paths.dream, 'run.lock');
+    // Orphan recovery: a killed process can leave an old run.lock whose owner
+    // PID is dead; withFileLock never steals, so clear a provably orphaned
+    // lock and retry once (see lockheal.ts).
+    const runUnderLock = async (op: () => Promise<void>): Promise<void> => {
+      try {
+        await withFileLock(runLockBase, op);
+      } catch (err) {
+        if (isLockTimeout(err) && (await healOrphanLock(`${runLockBase}.lock`))) {
+          await withFileLock(runLockBase, op);
+        } else {
+          throw err;
+        }
+      }
+    };
     try {
-      await withFileLock(join(store.paths.dream, 'run.lock'), async () => {
+      await runUnderLock(async () => {
         const state = await store.readState();
 
         // ── pass 1: ingest staged captures ────────────────────────────────

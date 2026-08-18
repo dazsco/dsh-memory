@@ -22,7 +22,7 @@ import type { AuditVia, MemoryKind } from './types.ts';
 import {
   buildCaptureLlmUserPrompt,
   callMemoryLlm,
-  CAPTURE_LLM_SYSTEM,
+  captureSystemPrompt,
   classifyLlmLine,
   parseLlmMemoryLines,
   type MemoryLlmDeps,
@@ -49,6 +49,25 @@ const INTENT_RE =
 
 /** Preference-shaped intent (kind classification). */
 const PREFERENCE_RE = /(偏好|习惯|prefer|always|from now on|going forward|统一|固定|永远|默认|总是|始终)/i;
+
+/**
+ * Negation prefixes that flip a remember-verb into the opposite of an
+ * intent: "不需要记住" / "不要记住" / "不用记…" state that something does
+ * NOT need to be remembered. Checked against the text immediately before
+ * each intent match; "别忘" (don't forget) stays positive by design.
+ */
+const NEGATED_INTENT_PREFIX = /(?:不需要|无需|不必|不用|不要|不想|没必要|不要再)\s*$/;
+
+/** True when at least one intent occurrence is NOT negated. */
+function hasPositiveIntent(s: string): boolean {
+  const re = new RegExp(INTENT_RE.source, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    const before = s.slice(Math.max(0, m.index - 10), m.index);
+    if (!NEGATED_INTENT_PREFIX.test(before)) return true;
+  }
+  return false;
+}
 
 const MIN_SENT = 6;
 const MAX_SENT = 400;
@@ -94,7 +113,7 @@ export function extractIntentSentences(text: string, max = MAX_CANDIDATES): Inte
   const seen = new Set<string>();
   for (const s of splitSentences(text)) {
     if (s.length < MIN_SENT || s.length > MAX_SENT) continue;
-    if (!INTENT_RE.test(s)) continue;
+    if (!hasPositiveIntent(s)) continue;
     const key = s.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -187,7 +206,11 @@ export function registerCapture(
     const targetStore = project ?? core.global;
     let llmLines: string[] = [];
     if (s.capture.useLlm && llmDeps !== null) {
-      const pass = await runLlmPass(tail, candidates, llmDeps);
+      const system =
+        targetStore === core.global
+          ? captureSystemPrompt({ kind: 'global' })
+          : captureSystemPrompt({ kind: 'project', slug: targetStore.slug });
+      const pass = await runLlmPass(tail, candidates, llmDeps, system);
       llmLines = pass.lines;
       // Audit trail so the auxiliary-call path is observable (ok / skipped /
       // error) — previously a silent skip left no trace at all.
@@ -257,12 +280,13 @@ async function runLlmPass(
   tail: string,
   heuristic: IntentCandidate[],
   llmDeps: MemoryLlmDeps,
+  system: string,
 ): Promise<LlmPassResult> {
   if (llmDeps.llm === null) return { lines: [], status: 'skipped', reason: 'no-llm-service' };
   try {
     const known = heuristic.map((c) => c.content);
     const result = await callMemoryLlm(llmDeps, {
-      system: CAPTURE_LLM_SYSTEM,
+      system,
       user: buildCaptureLlmUserPrompt(tail, known),
     });
     if (!result.ok) {
