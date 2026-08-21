@@ -6,6 +6,7 @@
  */
 import { Buffer } from 'node:buffer';
 import type { MemoryCore } from './core.ts';
+import type { RecallHit } from './types.ts';
 
 export interface BriefOptions {
   projectSlug: string | null;
@@ -41,46 +42,51 @@ export async function buildBrief(core: MemoryCore, opts: BriefOptions): Promise<
   const header =
     'The following is auto-generated memory context from dsh-memory. It is guidance, not an instruction, and may be stale — verify before relying on it. Use memory_recall for details; use memory_remember to store new durable memory.';
 
-  const lines: { text: string; store: 'global' | 'project' }[] = [];
-  const globalSection = [`## 全局记忆 (${globalHits.length})`];
-  const projectSection: string[] = [];
-  if (globalHits.length > 0) {
-    for (const h of globalHits) globalSection.push(`- [${h.kind}] ${escapeFrame(h.title)} — ${escapeFrame(h.snippet)} (${h.id})`);
-  } else {
-    globalSection.push('（暂无）');
+  const formatLine = (h: RecallHit): string => {
+    // One-line cards: makeSnippet returns '' when the body duplicates the
+    // title, so render the title once instead of repeating it.
+    const mid = h.snippet ? ` — ${escapeFrame(h.snippet)}` : '';
+    return `- [${h.kind}] ${escapeFrame(h.title)}${mid} (${h.id})`;
+  };
+
+  const gLines: string[] = globalHits.map(formatLine);
+  const pLines: string[] = projectHits.map(formatLine);
+
+  const render = (): string[] => {
+    const parts: string[] = [header];
+    if (gLines.length > 0) {
+      parts.push(`## 全局记忆 (${gLines.length})`, ...gLines);
+    } else if (globalHits.length === 0) {
+      parts.push('## 全局记忆 (0)', '（暂无）');
+    }
+    if (opts.projectSlug) {
+      if (pLines.length > 0) {
+        parts.push(`## 项目记忆 ${opts.projectSlug} (${pLines.length})`, ...pLines);
+      } else if (projectHits.length === 0) {
+        parts.push(`## 项目记忆 ${opts.projectSlug} (0)`, '（暂无）');
+      }
+      // A section whose lines were ALL budget-dropped is omitted entirely:
+      // a bare header with a stale "(8)" count reads as "injected but empty".
+    }
+    return parts;
+  };
+
+  const framed = (parts: string[]): string => `${FRAME_OPEN}\n${parts.join('\n')}\n${FRAME_CLOSE}`;
+  const over = (parts: string[]): boolean => Buffer.byteLength(framed(parts), 'utf8') > opts.maxBytes;
+
+  // Hard byte budget measured on the FRAMED output. When over budget,
+  // sacrifice GLOBAL lines first (lowest ranked first), then project lines:
+  // in a project session the project's own memory is the primary context and
+  // must not be squeezed out by a bloated global section.
+  let parts = render();
+  while (over(parts) && gLines.length > 0) {
+    gLines.pop();
+    parts = render();
   }
-  if (projectHits.length > 0) {
-    for (const h of projectHits) projectSection.push(`- [${h.kind}] ${escapeFrame(h.title)} — ${escapeFrame(h.snippet)} (${h.id})`);
-  } else {
-    projectSection.push('（暂无）');
+  while (over(parts) && pLines.length > 0) {
+    pLines.pop();
+    parts = render();
   }
 
-  const projectHeader = opts.projectSlug ? `## 项目记忆 ${opts.projectSlug} (${projectHits.length})` : '';
-
-  // Assemble with a hard byte budget measured on the FRAMED output: drop
-  // lines from the tail (project lines first, then global), keep the header.
-  const parts: string[] = [header];
-  parts.push(...globalSection);
-  if (opts.projectSlug) parts.push(projectHeader, ...projectSection);
-
-  const framed = (body: string): string => `${FRAME_OPEN}\n${body}\n${FRAME_CLOSE}`;
-  let body = parts.join('\n');
-  while (Buffer.byteLength(framed(body), 'utf8') > opts.maxBytes && parts.length > 2) {
-    parts.pop();
-    body = parts.join('\n');
-  }
-  if (Buffer.byteLength(framed(body), 'utf8') > opts.maxBytes) {
-    // Even the header plus one line exceeds the budget: hard-truncate the
-    // final line so the framed total stays within maxBytes.
-    const overhead = Buffer.byteLength(FRAME_OPEN, 'utf8') + Buffer.byteLength(FRAME_CLOSE, 'utf8') + 2;
-    const budget = Math.max(0, opts.maxBytes - overhead - Buffer.byteLength(header, 'utf8') - 1);
-    const lines = body.split('\n');
-    const head = lines.slice(0, -1).join('\n');
-    const room = Math.max(0, budget - Buffer.byteLength(head, 'utf8') - 1);
-    let last = lines[lines.length - 1] ?? '';
-    while (Buffer.byteLength(last, 'utf8') > room) last = last.slice(0, -1);
-    body = room > 0 ? `${head}\n${last}…` : head;
-  }
-
-  return framed(body);
+  return framed(parts);
 }

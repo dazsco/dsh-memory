@@ -123,10 +123,24 @@ export function rankWithMmr(candidates: ScoredCandidate[], mmrLambda = 0.3): Sco
   return selected;
 }
 
-/** Build a short display snippet from title+body. */
+/**
+ * Build a short display snippet from title+body.
+ *
+ * Most cards are one-line: body repeats the title verbatim. Surfacing that
+ * again would double every brief line, so when the body starts with the
+ * title we return only the remainder (usually ''). Callers must skip an
+ * empty snippet instead of rendering a duplicate.
+ */
 export function makeSnippet(title: string, body: string, maxChars = 120): string {
   const text = body.trim();
-  const base = text.length > 0 ? text : title;
-  if (base.length <= maxChars) return base;
-  return base.slice(0, maxChars - 1) + '…';
+  // No body (one-line cards store body='') → no snippet: the brief line
+  // already renders the title, so falling back to the title would repeat it.
+  if (text.length === 0) return '';
+  if (title.length > 0 && text.startsWith(title)) {
+    const rest = text.slice(title.length).replace(/^[\s:：,，;；\-—]+/, '').trim();
+    if (rest.length <= maxChars) return rest;
+    return rest.slice(0, maxChars - 1) + '…';
+  }
+  if (text.length <= maxChars) return text;
+  return text.slice(0, maxChars - 1) + '…';
 }

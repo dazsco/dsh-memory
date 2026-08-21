@@ -87,3 +87,16 @@ test('makeSnippet truncates with an ellipsis', () => {
   assert.ok(s.endsWith('…'));
   assert.equal(makeSnippet('t', 'short', 120), 'short');
 });
+
+test('makeSnippet does not repeat the title when the body is the title', () => {
+  // One-line cards (body == title) must yield an EMPTY snippet so the brief
+  // line renders the title once instead of twice.
+  assert.equal(makeSnippet('数据库连接串走环境变量。', '数据库连接串走环境变量。', 120), '');
+  assert.equal(makeSnippet('标题A', '标题A', 120), '');
+  // Body extending the title: only the remainder is surfaced.
+  assert.equal(makeSnippet('标题A', '标题A，补充说明：走环境变量。', 120), '补充说明：走环境变量。');
+  // Distinct body: unchanged behavior.
+  assert.equal(makeSnippet('标题A', '完全不同的正文内容', 120), '完全不同的正文内容');
+  // Empty body (one-line cards): no snippet, never the title again.
+  assert.equal(makeSnippet('标题A', '', 120), '');
+});
