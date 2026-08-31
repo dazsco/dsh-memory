@@ -19,7 +19,10 @@
  * turn. All side effects belong to the caller's fiber.
  */
 import type { Context } from '@deepseek-ai/cordis';
-import { settingsNamespace } from '@deepseek-ai/dsh-settings';
+// Type-only: pulls the `ctx.settings` Context merge from the settings package
+// (its index.d.ts augments cordis' Context; without an import the merge never
+// enters the program).
+import type {} from '@deepseek-ai/dsh-settings';
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
 import { MEMORY_NS, MemorySettingsSchema, type MemorySettings } from './settings.ts';
 import type { StoreLogger } from './store.ts';
@@ -30,7 +33,7 @@ import { registerDream, type DreamEngine } from './dream.ts';
 import { buildBrief } from './brief.ts';
 import type { MemoryLlmDeps, MemoryLlmService } from './llm.ts';
 
-/** Composition-row config (the cordis `llm:` section of this plugin row). */
+/** Composition-row config (the row's `config.llm` section; the loader passes only `config:` to apply). */
 interface MemoryPluginConfig {
   llm?: { provider?: string; model?: string } | null;
 }
@@ -85,7 +88,7 @@ export function apply(ctx: Context, config?: MemoryPluginConfig | null): void {
   // Settings is a hard dependency for the policy knobs; everything else is
   // optional and degrades with a warning.
   ctx.inject(['settings'], (scoped: Context) => {
-    const scope = scoped.settings.register(settingsNamespace(MEMORY_NS), MemorySettingsSchema, { applies: 'live' });
+    const scope = scoped.settings.register(MEMORY_NS, MemorySettingsSchema, { applies: 'live' });
     const getSettings = (): MemorySettings => scope.get();
 
     // Auxiliary LLM seam: the `llm` service is optional; absence degrades
@@ -122,7 +125,7 @@ export function apply(ctx: Context, config?: MemoryPluginConfig | null): void {
         let model = l.model;
         if (provider === '' || model === '') {
           try {
-            const def = scoped.settings.get(settingsNamespace('agent-default-model')) as
+            const def = scoped.settings.get('agent-default-model') as
               | { provider?: string; model?: string }
               | undefined;
             if (def !== undefined) {

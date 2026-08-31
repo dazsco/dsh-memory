@@ -32,12 +32,10 @@ const HOST_EXTERNALS = [
   "@deepseek-ai/dsh-llm",
   "@deepseek-ai/dsh-llm/message",
   "@deepseek-ai/dsh-llm/types",
-  "@deepseek-ai/dsh-session",
-  "@deepseek-ai/dsh-agent",
   "@deepseek-ai/dsh-atomic-write",
   "@deepseek-ai/dsh-home-paths",
-  "@deepseek-ai/dsh-system-prompt",
   "@deepseek-ai/dsh-timeout",
+  "@deepseek-ai/dsh-util-values",
 ];
 
 /** Every client specifier the factory's require() must resolve at runtime.

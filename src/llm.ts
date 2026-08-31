@@ -13,7 +13,8 @@
  * bounded by `maxOutputTokens`, a deadline (dsh-timeout), and the caller's
  * per-run budget counter.
  */
-import { BlockAssembler, createUserMessage, deepFreeze } from '@deepseek-ai/dsh-llm';
+import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
+import { deepFreeze } from '@deepseek-ai/dsh-util-values';
 import { deadline, timeoutOf } from '@deepseek-ai/dsh-timeout';
 import type { StreamChunk, UserMessage } from '@deepseek-ai/dsh-llm';
 
