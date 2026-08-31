@@ -40,26 +40,21 @@ const HOST_EXTERNALS = [
   "@deepseek-ai/dsh-timeout",
 ];
 
-/** Every client specifier the factory's require() must resolve at runtime. */
+/** Every client specifier the factory's require() must resolve at runtime.
+ *
+ * 0.1.2 client architecture: all framework access is type-only (Context
+ * merges), so the bundle's only runtime requires are the platform seed words
+ * and `@deepseek-ai/dsh-client-store` (createSnapshotStore). */
 const CLIENT_EXTERNALS = [
   // platform seed words (shell static module table)
   "react",
   "react/jsx-runtime",
   "react-dom",
   "react-dom/client",
-  // graph-row packages (resolved through the module loader)
   "@deepseek-ai/cordis",
-  "@deepseek-ai/dsh-client-runtime",
-  "@deepseek-ai/dsh-client-runtime/client",
-  "@deepseek-ai/dsh-client-connection",
-  "@deepseek-ai/dsh-client-connection/client",
-  "@deepseek-ai/dsh-client-locale",
-  "@deepseek-ai/dsh-client-locale/client",
+  "@deepseek-ai/dsh-client-store",
   "@deepseek-ai/dsh-client-ui-slots",
-  "@deepseek-ai/dsh-client-ui-settings",
-  "@deepseek-ai/dsh-client-ui-settings/client",
-  "@deepseek-ai/dsh-client-ui-settings-plugins",
-  "@deepseek-ai/dsh-client-ui-settings-plugins/client",
+  "@deepseek-ai/dsh-client-ui-primitives",
 ];
 
 function hostOptionsFor(entry, outFile) {

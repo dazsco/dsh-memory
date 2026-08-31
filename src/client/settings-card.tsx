@@ -11,7 +11,8 @@
  * watcher fires a Dream run without any save.
  */
 import { useRef, useState, type ReactNode } from 'react';
-import { createSnapshotStore, type SettingsScope, type SnapshotStore } from '@deepseek-ai/dsh-client-runtime/client';
+import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store';
+import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client';
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
 import type { MemorySettings } from '../settings.ts';
 import type { SettingsCardKey } from './locales.ts';
@@ -24,7 +25,6 @@ import {
   type CardActions,
   type CardFieldState,
   type CardShell,
-  type SettingsApi,
 } from './settings-form.ts';
 import { injectStyles } from './styles.ts';
 
@@ -74,13 +74,9 @@ export class MemorySettingsCardController {
 
   /**
    * @param scope - the bound settings scope for the `memory` namespace.
-   * @param api - the connection api face used for path mutations.
    */
-  constructor(
-    private readonly scope: SettingsScope<MemorySettings>,
-    private readonly api: SettingsApi,
-  ) {
-    this.form = new CardForm<MemorySettings>(scope, 'memory', api, [
+  constructor(private readonly scope: SettingsScope<MemorySettings>) {
+    this.form = new CardForm<MemorySettings>(scope, [
       booleanField(['enabled']),
       selectField(['capture', 'mode'], ['off', 'explicit', 'auto']),
       booleanField(['capture', 'useLlm']),
@@ -141,11 +137,8 @@ export class MemorySettingsCardController {
       ...this.form.actions(),
       dreamNow: () => {
         const seq = this.projection().dreamSeq;
-        return this.api
-          .settings.mutate({
-            ns: 'memory',
-            ops: [{ op: 'set', path: ['dream', 'requestSeq'], value: seq + 1 }],
-          })
+        return this.scope
+          .mutate([{ op: 'set', path: ['dream', 'requestSeq'], value: seq + 1 }])
           .then(() => undefined) as Promise<void>;
       },
     };

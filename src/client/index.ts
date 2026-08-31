@@ -6,24 +6,18 @@
  * tab pairs the served namespace with the card registered under that key.
  * No other browser behavior: all memory logic lives on the Host.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
-import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client';
+import type { Context } from '@deepseek-ai/cordis';
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client';
 // Type-only: pulls the settings-surface SlotMap merge and ctx.settingsScope.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client';
 // Type-only: pulls the `settings.plugin.item` SlotMap merge.
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client';
+// Type-only: pulls the `ctx.slots` SlotRegistry merge.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 import type { MemorySettings } from '../settings.ts';
 import { en, zh, type SettingsCardKey } from './locales.ts';
 import { MemorySettingsCard, MemorySettingsCardController } from './settings-card.tsx';
-
-/** 客户端根上下文的 connection 服务(由 dsh-client-connection 挂载)。 */
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    connection: ConnectionHandle;
-  }
-}
 
 /** Dictionary namespace owned by this plugin. */
 const NS = 'dsh-memory';
@@ -39,19 +33,19 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 }
 
 /** Services required by this plugin. */
-export const inject = ['slots', 'locale', 'connection', 'settingsScope'];
+export const inject = ['slots', 'locale', 'settingsScope'];
 
 /**
  * Plugin body: mount the settings card.
  * @param ctx - client root context.
  */
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-memory: dictionaries');
 
   // Bind the `memory` namespace; the card reads it reactively and writes it
   // through path ops (the section is nested, the scope's flat set() is not).
   const scope = ctx.settingsScope.bind<MemorySettings>({ namespace: SETTINGS_NS });
-  const controller = new MemorySettingsCardController(scope, ctx.connection.api);
+  const controller = new MemorySettingsCardController(scope);
 
   // Plugin configuration card: one staged form over the `memory` settings
   // namespace, contributed to the plugin-configuration section (Settings →

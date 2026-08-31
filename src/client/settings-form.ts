@@ -2,7 +2,7 @@
  * Staged form model behind the dsh-memory settings card — the plugin-card
  * store pattern of the DSH plugin-configuration section, adapted for a NESTED
  * settings section: every field is addressed by a path (e.g. `['capture',
- * 'useLlm']`) and writes go through the connection's `settings.mutate` with
+ * 'useLlm']`) and writes go through the bound settings scope's `mutate` with
  * path ops, so the user layer stays minimal (a field is stored only while the
  * user actually overrides it).
  *
@@ -13,7 +13,11 @@
  * and whether the user layer carries it (presence, not value equality, marks
  * an override).
  */
-import type { SettingsScope, SnapshotStore } from '@deepseek-ai/dsh-client-runtime/client';
+import type { SnapshotStore } from '@deepseek-ai/dsh-client-store';
+import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client';
+
+/** Structural twin of dsh-settings' JsonValue (field parses only yield JSON-safe scalars). */
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 /** The write one field's staged text performs when the card is saved. */
 export type FieldWrite = { kind: 'set'; value: unknown } | { kind: 'clear' };
@@ -67,20 +71,6 @@ export interface CardActions {
   save: () => void;
   /** Drop every staged edit. */
   discard: () => void;
-}
-
-/** The settings face of the connection api the form writes through (a structural view of `IApiClient.settings`). */
-export interface SettingsApi {
-  settings: {
-    mutate(payload: {
-      ns: string;
-      ops: (
-        | { op: 'set'; path: string[]; value: unknown }
-        | { op: 'unset'; path: string[] }
-      )[];
-      expectedRevision?: number;
-    }): Promise<unknown>;
-  };
 }
 
 /** Stable map key of one field path. */
@@ -192,14 +182,10 @@ export class CardForm<T> {
 
   /**
    * @param scope - the bound settings scope for this card's namespace.
-   * @param ns - the settings namespace (must match `scope`).
-   * @param api - the connection api face used for path mutations.
    * @param specs - the section fields this card edits.
    */
   constructor(
     private readonly scope: SettingsScope<T>,
-    private readonly ns: string,
-    private readonly api: SettingsApi,
     specs: CardFieldSpec[],
   ) {
     this.specs = new Map(specs.map((spec) => [keyOf(spec.path), spec]));
@@ -326,15 +312,16 @@ export class CardForm<T> {
 
   private async mutate(op: { op: 'set'; path: readonly string[]; value: unknown } | { op: 'unset'; path: readonly string[] }): Promise<void> {
     const revision = this.scope.getSnapshot().revision;
-    await this.api.settings.mutate({
-      ns: this.ns,
-      ops: [
+    await this.scope.mutate(
+      [
         op.op === 'set'
-          ? { op: 'set' as const, path: [...op.path], value: op.value }
+          // Field parses only yield JSON-safe scalars; the scope's path-op
+          // view types the value as JsonValue (structurally the same).
+          ? { op: 'set' as const, path: [...op.path], value: op.value as JsonValue }
           : { op: 'unset' as const, path: [...op.path] },
       ],
-      ...(revision === undefined ? {} : { expectedRevision: revision }),
-    });
+      ...(revision === undefined ? [] : [revision]),
+    );
   }
 
   private stage(key: string, edit: StagedEdit): void {
