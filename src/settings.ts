@@ -32,7 +32,7 @@ export const MemorySettingsSchema = z.object({
   dream: z
     .object({
       enabled: z.boolean().default(true),
-      /** LLM passes (summarize/promote/conflict) via the user's own route. */
+      /** LLM passes (summarize/conflict) via the user's own route. */
       useLlm: z.boolean().default(true),
       /** Idle-tick cadence (minutes, min 5). */
       intervalMinutes: z.natural().min(5).default(30),

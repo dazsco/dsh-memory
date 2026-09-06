@@ -17,14 +17,12 @@ export interface MemoryRules {
   alwaysNotes: string[];
   /** Retention days per kind ("retention" section, e.g. `- observation: 30 天`). */
   retention: Partial<Record<MemoryKind, number>>;
-  /** Sessions of corroboration required for project→global promotion. */
-  promoteSessions: number | null;
   /** Other free-form lines in the Memory section (LLM-facing guidance). */
   notes: string[];
 }
 
 export function emptyRules(): MemoryRules {
-  return { denyKeywords: [], alwaysNotes: [], retention: {}, promoteSessions: null, notes: [] };
+  return { denyKeywords: [], alwaysNotes: [], retention: {}, notes: [] };
 }
 
 const HEADING_RE = /^ {0,3}(#{1,6})\s+(.*)$/;
@@ -63,7 +61,7 @@ export function parseMemorySection(markdown: string): MemoryRules | null {
   const body = lines.slice(start + 1, end);
 
   const rules = emptyRules();
-  let bucket: 'deny' | 'always' | 'retention' | 'promotion' | 'notes' | null = null;
+  let bucket: 'deny' | 'always' | 'retention' | 'notes' | null = null;
   for (const line of body) {
     const h = HEADING_RE.exec(line);
     if (h) {
@@ -71,7 +69,6 @@ export function parseMemorySection(markdown: string): MemoryRules | null {
       if (/^(never|永远不记|禁止|不要记|不记|do not remember)/.test(t)) bucket = 'deny';
       else if (/^(always|总是|记住|应该记|remember)/.test(t)) bucket = 'always';
       else if (/^(retention|保留|保留期|过期)/.test(t)) bucket = 'retention';
-      else if (/^(promotion|promote|晋升|提升)/.test(t)) bucket = 'promotion';
       else bucket = 'notes';
       continue;
     }
@@ -96,11 +93,6 @@ export function parseMemorySection(markdown: string): MemoryRules | null {
         }
         break;
       }
-      case 'promotion': {
-        const n = /(\d+)/.exec(text);
-        if (n && rules.promoteSessions === null) rules.promoteSessions = Number(n[1]);
-        break;
-      }
       default:
         rules.notes.push(text);
     }
@@ -117,43 +109,9 @@ export function mergeRules(layers: MemoryRules[]): MemoryRules {
     for (const [k, v] of Object.entries(layer.retention)) {
       out.retention[k as MemoryKind] = v as number;
     }
-    if (layer.promoteSessions !== null) out.promoteSessions = layer.promoteSessions;
     for (const n of layer.notes) pushUnique(out.notes, n);
   }
   return out;
-}
-
-/**
- * Effective rules for one store: user-global AGENTS.md first, then the
- * project's AGENTS.md (falls back to CLAUDE.md, matching dsh-agent-instructions
- * candidates). Missing files contribute nothing.
- */
-export async function loadAgentRules(readers: () => Promise<string[] | null>, projectFile?: string | null): Promise<MemoryRules> {
-  const layers: MemoryRules[] = [];
-  const userFiles = await readers();
-  for (const file of userFiles ?? []) {
-    const text = await readSafe(file);
-    if (text === null) continue;
-    const parsed = parseMemorySection(text);
-    if (parsed) layers.push(parsed);
-  }
-  if (projectFile) {
-    const text = await readSafe(projectFile);
-    if (text !== null) {
-      const parsed = parseMemorySection(text);
-      if (parsed) layers.push(parsed);
-    }
-  }
-  return mergeRules(layers);
-}
-
-async function readSafe(file: string): Promise<string | null> {
-  try {
-    const { readTextSafe } = await import('./fsutil.ts');
-    return await readTextSafe(file);
-  } catch {
-    return null;
-  }
 }
 
 function pushUnique(arr: string[], value: string): void {

@@ -121,12 +121,15 @@ export type AuditOp =
   | 'archive'
   | 'delete'
   | 'block'
-  | 'promote'
   | 'dream'
   | 'forget'
   | 'hard-delete'
+  | /** GUI archive → cards inverse move (v2 per-card management). */
+  'restore'
   | /** Auxiliary LLM path outcome for one turn capture (ok/skipped/error). */
-  'llm';
+  'llm'
+  | /** A malformed (unparseable) inbox line skipped + advanced past by Dream. */
+  'quarantine';
 
 export type AuditVia = 'tool' | 'auto' | 'auto-heuristic' | 'auto-llm' | 'dream' | 'dream-llm' | 'user' | 'client' | 'system';
 

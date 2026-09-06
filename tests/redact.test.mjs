@@ -28,6 +28,26 @@ test('clean text passes without reasons', () => {
   assert.equal(scan.reasons.length, 0);
 });
 
+test('near-miss fixtures are NOT blocked (no false-positive over-block)', () => {
+  const nearMisses = [
+    'the token=abc placeholder in the docs', // short value, below the 6-char floor
+    'AKIA123 is not a real key id', // AWS ids are AKIA + 16
+    'the query string ?api_key=abc is a stub',
+    'sk-abc is a truncated example', // sk- keys need 16+ chars
+    'ghp_123 is not a GitHub token',
+    'Bearer abc is a placeholder header',
+    'postgres://localhost:5432/mydb has no userinfo', // no user:pass@
+    'https://example.com/docs/api_key=abc', // short value in a URL
+    'base64 payload c2VjcmV0LXZhbHVl is not a JWT', // no two dots / eyJ shape
+    'password: "x" and secret: "y" are single-char stubs',
+  ];
+  for (const text of nearMisses) {
+    const scan = scanSecrets(text);
+    assert.equal(scan.blocked, false, `near-miss must pass: ${text}`);
+    assert.equal(scan.reasons.length, 0, `no reasons: ${text}`);
+  }
+});
+
 test('audit reasons carry pattern names only, never matched content', () => {
   const scan = scanSecrets('AKIAIOSFODNN7EXAMPLE');
   assert.equal(scan.blocked, true);
@@ -48,6 +68,13 @@ test('pii off leaves text untouched', () => {
   const out = redactPii('bob@example.com', 'off');
   assert.equal(out.text, 'bob@example.com');
   assert.equal(out.hits.length, 0);
+});
+
+test('pii warn reports categories but does not mask (F17-4)', () => {
+  const out = redactPii('call 13812345678 or bob@example.com', 'warn');
+  assert.deepEqual(out.hits.sort(), ['cn-mobile', 'email'], 'both categories reported');
+  assert.ok(out.text.includes('13812345678'), 'warn mode keeps the value verbatim');
+  assert.ok(out.text.includes('bob@example.com'), 'warn mode keeps the email verbatim');
 });
 
 test('gateCandidate blocks the whole candidate on a rule deny keyword', () => {

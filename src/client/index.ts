@@ -3,8 +3,9 @@
  *
  * Registers the `memory` settings card into the plugin-configuration section
  * (`settings.plugin.item`), keyed by the settings namespace it edits — the
- * tab pairs the served namespace with the card registered under that key.
- * No other browser behavior: all memory logic lives on the Host.
+ * tab pairs the served namespace with the card registered under that key —
+ * and the Memory page into the settings nav (`settings.section`). No memory
+ * LOGIC runs in the browser: every read/write goes to the Host.
  */
 import type { Context } from '@deepseek-ai/cordis';
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
@@ -18,6 +19,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 import type { MemorySettings } from '../settings.ts';
 import { en, zh, type SettingsCardKey } from './locales.ts';
 import { MemorySettingsCard, MemorySettingsCardController } from './settings-card.tsx';
+import { MemoryPage, MemoryPageController } from './memory-page.tsx';
 
 /** Dictionary namespace owned by this plugin. */
 const NS = 'dsh-memory';
@@ -36,7 +38,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 export const inject = ['slots', 'locale', 'settingsScope'];
 
 /**
- * Plugin body: mount the settings card.
+ * Plugin body: mount the settings card and the Memory page (browse +
+ * per-card archive/delete/restore).
  * @param ctx - client root context.
  */
 export function apply(ctx: Context): void {
@@ -44,8 +47,10 @@ export function apply(ctx: Context): void {
 
   // Bind the `memory` namespace; the card reads it reactively and writes it
   // through path ops (the section is nested, the scope's flat set() is not).
+  // The Memory page reuses the same scope for its "Dream now" trigger.
   const scope = ctx.settingsScope.bind<MemorySettings>({ namespace: SETTINGS_NS });
   const controller = new MemorySettingsCardController(scope);
+  const pageController = new MemoryPageController(scope);
 
   // Plugin configuration card: one staged form over the `memory` settings
   // namespace, contributed to the plugin-configuration section (Settings →
@@ -60,6 +65,27 @@ export function apply(ctx: Context): void {
         inject: () => controller.inject(),
       },
       MemorySettingsCard,
+    ),
+  );
+
+  // Memory page in the settings nav: browse every store (global + all
+  // projects), search and read cards, inspect the inbox and Dream state, and
+  // manage single cards (archive / delete / restore through the Host's exact
+  // fetch routes — the same audited store ops the agent tools use).
+  // `settings.section` is a list slot — the shell stacks one page per entry;
+  // the label thunk re-resolves on locale change (the shell re-renders rows
+  // when the locale revision moves). Ordered after the shipped sections.
+  ctx.slots.inject('settings.section', () =>
+    ctx.slots.register(
+      {
+        name: 'settings.section',
+        id: 'memory',
+        order: 25,
+        label: () => ctx.locale.bind(NS)('page.nav'),
+        locale: NS,
+        inject: () => ({ dreamNow: () => pageController.dreamNow() }),
+      },
+      MemoryPage,
     ),
   );
 }

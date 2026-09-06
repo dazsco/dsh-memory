@@ -7,10 +7,9 @@
  * dependency, deterministic output, and parse errors fail loud.
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { MemoryFsError, MEMORY_KINDS, type MemoryCard, type MemoryKind, type MemorySource } from './types.ts';
-import { readTextSafe } from './fsutil.ts';
+import { mtimeMsSafe, readTextSafe } from './fsutil.ts';
 import { tokenize } from './retrieval.ts';
 
 const FRONTMATTER_DELIM = '---';
@@ -181,11 +180,38 @@ export function cardIdFromFileName(name: string): string | null {
   return m ? name.slice(0, -3) : null;
 }
 
-/** Read + parse one card file; null when absent. */
-export async function readCardFile(dir: string, id: string): Promise<MemoryCard | null> {
+/** True when `id` is a well-formed card id (m-YYYYMMDD-<4–10 lowercase hex>). */
+export function isValidCardId(id: string): boolean {
+  return /^m-\d{8}-[a-z0-9]{4,10}$/.test(id);
+}
+
+// One warning per (file, mtime): a permanently corrupt card stays loud without
+// spamming every read of the store.
+const corruptCardWarned = new Map<string, number>();
+
+/**
+ * Read + parse one card file; null when absent OR corrupt.
+ *
+ * A corrupt card (bad frontmatter, a partial write) must never brick the
+ * store: every caller treats null as "card unavailable right now" and keeps
+ * going with the rest. `warn` (optional) logs one warning per file version.
+ */
+export async function readCardFile(dir: string, id: string, warn?: (msg: string) => void): Promise<MemoryCard | null> {
   const text = await readTextSafe(join(dir, `${id}.md`));
   if (text === null) return null;
-  return parseCard(text, id);
+  try {
+    return parseCard(text, id);
+  } catch (err) {
+    if (warn !== undefined) {
+      const mtime = (await mtimeMsSafe(join(dir, `${id}.md`)).catch(() => 0)) ?? 0;
+      const key = `${dir}/${id}`;
+      if (corruptCardWarned.get(key) !== mtime) {
+        corruptCardWarned.set(key, mtime);
+        warn(`[dsh-memory] corrupt card ${id} skipped until repaired: ${(err as Error).message}`);
+      }
+    }
+    return null;
+  }
 }
 
 /** Atomically write a card file (0600). */
@@ -218,5 +244,3 @@ function clampNum(value: unknown, min: number, max: number, fallback: number): n
   const n = typeof value === 'number' && Number.isFinite(value) ? value : fallback;
   return Math.min(max, Math.max(min, n));
 }
-
-export { fs as nodeFs };

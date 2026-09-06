@@ -201,6 +201,8 @@ test('callMemoryLlm: stalled stream (no chunks, no close, signal ignored) is sti
   // the for-await then suspended forever because throwIfAborted only runs
   // when a chunk arrives. The drain must race against the deadline.
   const started = Date.now();
+  let iteratorCount = 0;
+  let returnCount = 0;
   const deps = {
     ...baseDeps,
     route: () => ({ provider: 'deepseek', model: 'deepseek-v4-flash', maxOutputTokens: 100, timeoutMs: 40 }),
@@ -209,9 +211,13 @@ test('callMemoryLlm: stalled stream (no chunks, no close, signal ignored) is sti
       stream() {
         return {
           [Symbol.asyncIterator]() {
+            iteratorCount += 1;
             return {
               next: () => new Promise(() => {}), // never resolves: no chunks, no close
-              return: () => Promise.resolve({ done: true, value: undefined }),
+              return: () => {
+                returnCount += 1;
+                return Promise.resolve({ done: true, value: undefined });
+              },
             };
           },
         };
@@ -222,6 +228,10 @@ test('callMemoryLlm: stalled stream (no chunks, no close, signal ignored) is sti
   assert.equal(r.ok, false);
   assert.equal(r.reason, 'timeout');
   assert.ok(Date.now() - started < 2000, `stalled stream must be bounded by the deadline, took ${Date.now() - started}ms`);
+  // F13: exactly ONE iterator for the whole call, and a best-effort cancel
+  // of that same iterator — no second drain, no re-entrancy.
+  assert.equal(iteratorCount, 1, 'one iterator per call');
+  assert.equal(returnCount, 1, 'the stalled iterator is cancelled once');
 });
 
 test('callMemoryLlm: per-request maxOutputTokens override wins', async () => {

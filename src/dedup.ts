@@ -57,16 +57,3 @@ export function normalizeMemoryText(text: string): string {
   }
   return out.join('\n');
 }
-
-/**
- * Promotion gate: a project card is eligible for a global copy when its
- * confidence is high AND it was corroborated by at least `minSessions`
- * distinct source sessions (or a rule says otherwise).
- */
-export function promotionEligible(
-  meta: { confidence: number; sources: readonly string[] },
-  minConfidence: number,
-  minSessions: number,
-): boolean {
-  return meta.confidence >= minConfidence && new Set(meta.sources).size >= minSessions;
-}

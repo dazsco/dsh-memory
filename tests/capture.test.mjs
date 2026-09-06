@@ -320,3 +320,140 @@ test('capture: harness checkpoint summaries are skipped via marker', async () =>
 test('default auxiliary LLM deadline is 60s (long tails on 27B-class models)', () => {
   assert.equal(defaultMemorySettings().llm.timeoutMs, 60000);
 });
+
+test('F9: useLlm=true but no LLM service → capture works, no per-turn llm audit spam', async () => {
+  const inbox = [];
+  const audits = [];
+  const fakeStore = {
+    slug: 'global',
+    audit: async (e) => {
+      audits.push(e);
+    },
+    pushInbox: async (entry) => {
+      inbox.push(entry);
+    },
+  };
+  const fakeCore = {
+    global: fakeStore,
+    projectStoreForCwd: async () => null,
+    rulesFor: async () => ({ denyKeywords: [] }),
+  };
+  const listeners = new Map();
+  const settings = defaultMemorySettings();
+  settings.capture.useLlm = true; // the knob is ON, but the service is absent
+  registerCapture(
+    { on: (ev, fn) => listeners.set(ev, fn) },
+    fakeCore,
+    () => settings,
+    null,
+    {
+      llm: null, // startup-time absence, exactly like a deployment without the llm service
+      configRoute: { provider: 'deepseek', model: 'deepseek-v4-flash' },
+      route: () => ({ provider: '', model: '', maxOutputTokens: 2000, timeoutMs: 60000 }),
+    },
+  );
+
+  // three turns — pre-fix, each one appended an `op:'llm'` audit line
+  for (let i = 0; i < 3; i += 1) {
+    const session = {
+      id: `session-no-llm-${i}`,
+      header: { cwd: undefined, delegationDepth: 0 },
+      deriveMessages: () => [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `记住:第 ${i} 条规则是代码注释一律用中文写,依赖管理统一用 pnpm,并且每次合并请求之前要先跑一遍 typecheck 和回归测试,全部通过之后才能推送。这条约定适用于仓库内的所有改动,包括文档、配置和脚本。这是足够长的说明文本,用来确保超过最小内容长度门槛以触发抽取流程。`,
+            },
+          ],
+        },
+      ],
+    };
+    listeners.get('session/event')(session, { type: 'turn/end' });
+  }
+  await new Promise((r) => setTimeout(r, 40));
+
+  assert.equal(inbox.length, 3, 'heuristic capture still stages cards');
+  assert.ok(!audits.some((e) => e.op === 'llm'), 'no per-turn llm audit lines without a service');
+});
+
+test('F9: useLlm=true WITH a working LLM service → the pass is audited (ok)', async () => {
+  const inbox = [];
+  const audits = [];
+  const fakeStore = {
+    slug: 'global',
+    audit: async (e) => {
+      audits.push(e);
+    },
+    pushInbox: async (entry) => {
+      inbox.push(entry);
+    },
+  };
+  const fakeCore = {
+    global: fakeStore,
+    projectStoreForCwd: async () => null,
+    rulesFor: async () => ({ denyKeywords: [] }),
+  };
+  const listeners = new Map();
+  const settings = defaultMemorySettings();
+  settings.capture.useLlm = true;
+  // a minimal fake llm service that streams one memory line (real chunk protocol)
+  const reply = '记住这条来自辅助模型的规则，构建产物统一放在 dist 目录。';
+  const llm = {
+    listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+    stream: () => {
+      const chunks = [
+        { type: 'block-start', index: 0, blockType: 'text' },
+        { type: 'text-delta', index: 0, text: reply },
+        { type: 'block-end', index: 0, block: { type: 'text', text: reply } },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ];
+      let i = 0;
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next: async () => (i < chunks.length ? { value: chunks[i++], done: false } : { value: undefined, done: true }),
+          };
+        },
+      };
+    },
+  };
+  registerCapture(
+    { on: (ev, fn) => listeners.set(ev, fn) },
+    fakeCore,
+    () => settings,
+    null,
+    {
+      llm,
+      configRoute: { provider: 'deepseek', model: 'deepseek-v4-flash' },
+      route: () => ({ provider: '', model: '', maxOutputTokens: 2000, timeoutMs: 60000 }),
+    },
+  );
+
+  const session = {
+    id: 'session-llm-on',
+    header: { cwd: undefined, delegationDepth: 0 },
+    deriveMessages: () => [
+      // >120 chars (minTurnContentChars) and free of heuristic intent words,
+      // so ONLY the LLM pass can stage anything.
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: '今天团队讨论了一些流程细节，包括发布窗口安排在周五下午，数据库快照每周日凌晨生成，代码评审需要两名批准人，接口变更必须提前在群里同步。请把这些整理成项目约定，方便以后新同学入职时参考，也避免每次都要口头重复一遍。另外上线前的回归测试要先跑一遍全量用例再灰度发布，这些细节也记录到文档里比较好。',
+          },
+        ],
+      },
+    ],
+  };
+  listeners.get('session/event')(session, { type: 'turn/end' });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const llmAudits = audits.filter((e) => e.op === 'llm');
+  assert.equal(llmAudits.length, 1, 'one llm audit line for the turn');
+  assert.match(llmAudits[0].detail, /^ok/, `detail is the pass status (${llmAudits[0].detail})`);
+  assert.equal(inbox.length, 1, 'the LLM line was staged');
+  assert.equal(inbox[0].via, 'auto-llm');
+});

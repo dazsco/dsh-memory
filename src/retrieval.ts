@@ -62,7 +62,7 @@ export function bm25Score(
   return score;
 }
 
-/** Recency: exponential decay from last access (half-life ≈ 14 days). */
+/** Recency: exponential decay from last access (half-life ≈ 5.8 days). */
 export function cardRecency(lastAccessed: string, now: Date): number {
   const hours = Math.max(0, (now.getTime() - Date.parse(lastAccessed)) / 3_600_000);
   return Math.pow(0.995, hours);
@@ -90,10 +90,7 @@ export interface ScoredCandidate {
   score: number;
 }
 
-/**
- * Rank candidates across stores with MMR diversity penalty.
- * @param maxRel normalizes relevance into 0..1 (0 when all zero).
- */
+/** Rank candidates across stores with MMR diversity penalty. */
 export function rankWithMmr(candidates: ScoredCandidate[], mmrLambda = 0.3): ScoredCandidate[] {
   const selected: ScoredCandidate[] = [];
   const pools = new Map<string, ScoredCandidate>(candidates.map((c) => [c.id, c]));

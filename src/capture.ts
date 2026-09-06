@@ -211,7 +211,11 @@ export function registerCapture(
     const project = cwd ? await core.projectStoreForCwd(cwd).catch(() => null) : null;
     const targetStore = project ?? core.global;
     let llmLines: string[] = [];
-    if (s.capture.useLlm && llmDeps !== null) {
+    // A missing service is a startup-time condition (one warning at
+    // registration), not a per-turn event: skip the pass AND the audit line
+    // so every turn in a no-llm deployment does not append a
+    // `skipped no-llm-service` audit entry.
+    if (s.capture.useLlm && llmDeps !== null && llmDeps.llm !== null) {
       const system =
         targetStore === core.global
           ? captureSystemPrompt({ kind: 'global' })

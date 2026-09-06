@@ -6,9 +6,9 @@
 export { MEMORY_SCHEMA_VERSION, MEMORY_KINDS, MemoryPolicyError, MemoryFsError } from './types.ts';
 export type { MemoryCard, CardMeta, MemoryIndex, InboxEntry, AuditEntry, DreamState, RecallHit, StatusReport } from './types.ts';
 
-export { readTextSafe, readJsonSafe, writeJsonAtomic, appendJsonl, readJsonlLines, listFiles, mtimeMsSafe, ensureDir } from './fsutil.ts';
+export { readTextSafe, readJsonSafe, writeJsonAtomic, appendJsonl, readJsonlLines, readJsonlLinesLenient, listFiles, mtimeMsSafe, ensureDir } from './fsutil.ts';
 
-export { makeCardId, parseCard, serializeCard, cardDigest, cardTokenCount, cardIdFromFileName, readCardFile, writeCardFile, assertRoundTrip } from './cards.ts';
+export { makeCardId, parseCard, serializeCard, cardDigest, cardTokenCount, cardIdFromFileName, isValidCardId, readCardFile, writeCardFile, assertRoundTrip } from './cards.ts';
 
 export { SECRET_PATTERNS, scanSecrets, redactPii, gateCandidate } from './redact.ts';
 export type { SecretScan, PiiMode, PiiResult } from './redact.ts';
@@ -19,7 +19,7 @@ export type { MemoryRules } from './rules.ts';
 export { tokenize, jaccard, bm25Score, cardRecency, cardStrength, compositeScore, rankWithMmr, makeSnippet } from './retrieval.ts';
 export type { ScoredCandidate } from './retrieval.ts';
 
-export { dedupDecide, normalizeMemoryText, promotionEligible, DEDUP_THRESHOLDS } from './dedup.ts';
+export { dedupDecide, normalizeMemoryText, DEDUP_THRESHOLDS } from './dedup.ts';
 export type { DedupDecision, DedupAction } from './dedup.ts';
 
 export {
@@ -76,5 +76,21 @@ export {
 export type { MemoryLlmDeps, MemoryLlmService, MemoryLlmRequest, LlmResult, LlmFailReason, DreamCardLine, ConflictPair, ConflictDecision } from './llm.ts';
 
 export { registerMemoryTools } from './tools.ts';
+
+export { makeBrowseHandlers, registerBrowseRoutes, MEMORY_BROWSE_PATHS } from './browse.ts';
+export type {
+  MemoryBrowseDeps,
+  BrowseConnection,
+  BrowseCtx,
+  BrowseSummary,
+  BrowseStoreSummary,
+  BrowseCardSummary,
+  BrowseCardList,
+  BrowseCardDetail,
+  BrowseInbox,
+  BrowseArchivedCard,
+  BrowseArchiveList,
+  BrowseCardActionResult,
+} from './browse.ts';
 
 export { apply } from './index.ts';

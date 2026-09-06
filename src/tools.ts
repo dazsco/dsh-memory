@@ -67,7 +67,7 @@ export function registerMemoryTools(
         'Store one durable memory (fact, preference, decision, procedure, or commitment) in project or global memory. Secrets are blocked automatically. One memory per call; keep it self-contained.',
       parameters: {
         content: { type: 'string', required: true, description: 'The memory content (1–3 sentences, self-contained)' },
-        kind: { type: 'string', description: 'fact | preference | decision | procedure | commitment | observation (default: fact)' },
+        kind: { type: 'string', description: 'fact | preference | decision | procedure | commitment | observation | summary (default: fact)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional short tags (max 8)' },
         scope: { type: 'string', description: 'auto | project | global (default: auto → project when the cwd is inside a project)' },
         importance: { type: 'integer', description: '1–10 (default 5)' },
@@ -100,11 +100,21 @@ export function registerMemoryTools(
               cwd: cwdOf(exec),
               importance: typeof a.importance === 'number' ? a.importance : undefined,
               maxBytes: st.budget.maxCardBytes,
+              // Honor the live PII setting on the explicit path too (warn
+              // mode stores raw, redact mode masks; names-only in warnings).
+              piiMode: st.redact.pii,
             },
             'tool',
             sessionIdOf(exec),
           );
-          return { id: out.card.id, store: out.slug, title: out.card.title, blocked: false, reason: '' };
+          return {
+            id: out.card.id,
+            store: out.slug,
+            title: out.card.title,
+            blocked: false,
+            reason: '',
+            ...(out.warnings.length > 0 ? { piiWarnings: out.warnings } : {}),
+          };
         } catch (err) {
           if (err instanceof MemoryPolicyError) {
             return { id: '', store: '', title: '', blocked: true, reason: err.reasons.join(', ') };

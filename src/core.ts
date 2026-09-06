@@ -18,9 +18,9 @@ import {
   registerProjectPath,
   storePathsFor,
 } from './paths.ts';
-import { listFiles, readTextSafe } from './fsutil.ts';
-import { makeCardId } from './cards.ts';
-import { gateCandidate } from './redact.ts';
+import { readTextSafe } from './fsutil.ts';
+import { isValidCardId, makeCardId } from './cards.ts';
+import { gateCandidate, type PiiMode } from './redact.ts';
 import { emptyRules, parseMemorySection, mergeRules } from './rules.ts';
 import type { MemoryRules } from './rules.ts';
 import {
@@ -57,6 +57,12 @@ export interface RememberInput {
   importance?: number;
   /** Card content byte cap (settings budget). */
   maxBytes?: number;
+  /**
+   * PII policy for THIS write (settings `redact.pii`). Defaults to 'redact' so
+   * direct core callers without a settings view keep the safe default; the
+   * tool path always passes the live setting.
+   */
+  piiMode?: PiiMode;
 }
 
 export interface RecallOptions {
@@ -78,6 +84,8 @@ export class MemoryCore {
   readonly global: MemoryStore;
   private projects = new Map<string, MemoryStore>();
   private projectRootCache = new Map<string, string | null>();
+  /** Root → registered slug, so repeat calls never rewrite the registry. */
+  private projectSlugCache = new Map<string, string>();
   private logger: StoreLogger | null;
 
   private constructor(root: string, logger: StoreLogger | null) {
@@ -110,7 +118,13 @@ export class MemoryCore {
     return this.projects.get(slug) ?? null;
   }
 
-  /** Resolve (and register on first sight) the project store for a cwd. */
+  /**
+   * Resolve (and register ONCE per process, on first sight) the project store
+   * for a cwd. The registry read-modify-write is expensive and racy across
+   * processes, so the root→slug mapping is cached: after the first
+   * registration for a root, every recall/remember hits this cache instead
+   * of rewriting projects.json.
+   */
   async projectStoreForCwd(cwd: string | null | undefined): Promise<MemoryStore | null> {
     if (!cwd) return null;
     let root: string | null;
@@ -120,19 +134,19 @@ export class MemoryCore {
     } else {
       root = await findProjectRoot(cwd).catch(() => null);
       this.projectRootCache.set(cwd, root);
-      if (root !== null) {
-        const { slug, storeRoot } = await registerProjectPath(root);
-        let store = this.projects.get(slug);
-        if (store === undefined) {
-          store = new MemoryStore('project', slug, storePathsFor(storeRoot), this.logger);
-          await store.init();
-          this.projects.set(slug, store);
-        }
-      }
     }
     if (root === null) return null;
-    const { slug } = await registerProjectPath(root);
-    return this.projects.get(slug) ?? null;
+    const cachedSlug = this.projectSlugCache.get(root);
+    if (cachedSlug !== undefined) return this.projects.get(cachedSlug) ?? null;
+    const { slug, storeRoot } = await registerProjectPath(root);
+    this.projectSlugCache.set(root, slug);
+    let store = this.projects.get(slug);
+    if (store === undefined) {
+      store = new MemoryStore('project', slug, storePathsFor(storeRoot), this.logger);
+      await store.init();
+      this.projects.set(slug, store);
+    }
+    return store;
   }
 
   /** Project path behind a store (from the registry). */
@@ -178,9 +192,15 @@ export class MemoryCore {
 
   /**
    * Explicit remember (tool). Policy gate first (secrets block, rules deny,
-   * PII policy), then atomic card write + audit.
+   * PII policy), then atomic card write + audit. `warnings` carries the PII
+   * category NAMES detected by the gate (warn mode: stored raw; redact mode:
+   * stored masked) — never the matched content.
    */
-  async remember(input: RememberInput, via: AuditVia, sessionId?: string): Promise<{ card: MemoryCard; slug: string; path: string }> {
+  async remember(
+    input: RememberInput,
+    via: AuditVia,
+    sessionId?: string,
+  ): Promise<{ card: MemoryCard; slug: string; path: string; warnings: string[] }> {
     const scope = (input.scope ?? 'auto') as 'project' | 'global' | 'auto';
     let store: MemoryStore;
     if (scope === 'global') {
@@ -203,7 +223,10 @@ export class MemoryCore {
     }
 
     const rules = await this.rulesFor(store.slug);
-    const gated = gateCandidate(content, rules.denyKeywords, 'redact');
+    // The explicit remember path honors the live `redact.pii` setting too —
+    // previously it was hard-coded to 'redact' while capture/dream used the
+    // setting, so the GUI knob silently did not cover tool writes.
+    const gated = gateCandidate(content, rules.denyKeywords, input.piiMode ?? 'redact');
     if (!gated.ok) {
       await store.audit({
         ts: new Date().toISOString(),
@@ -216,6 +239,10 @@ export class MemoryCore {
       throw new MemoryPolicyError(gated.reasons);
     }
 
+    // The card is built from the GATED text: in redact mode this is the
+    // masked version (building from `content` would store the raw PII the
+    // gate was supposed to remove).
+    const safe = gated.text;
     const now = new Date().toISOString();
     const kind: MemoryKind =
       typeof input.kind === 'string' && (MEMORY_KINDS as readonly string[]).includes(input.kind)
@@ -236,8 +263,8 @@ export class MemoryCore {
       supersedes: [],
       source: { session: sessionId ?? '', turn: null },
       links: [],
-      title: firstLine(content),
-      body: content === firstLine(content) ? '' : content.slice(firstLine(content).length).trim(),
+      title: firstLine(safe),
+      body: safe === firstLine(safe) ? '' : safe.slice(firstLine(safe).length).trim(),
     };
     await store.putCard(card);
     await store.audit({
@@ -249,7 +276,7 @@ export class MemoryCore {
       via,
       session: sessionId,
     });
-    return { card, slug: store.slug, path: join(store.paths.cards, `${card.id}.md`) };
+    return { card, slug: store.slug, path: join(store.paths.cards, `${card.id}.md`), warnings: gated.warnings };
   }
 
   /** Stage one capture in a store's inbox (auto-capture path). */
@@ -369,6 +396,9 @@ export class MemoryCore {
     const hard = Boolean(args.hard);
     const removed: ForgetResult['removed'] = [];
     if (args.id) {
+      // Defense in depth: a malformed id (path separators, traversal, junk)
+      // is treated as "not found" — it can never reach a filesystem join.
+      if (!isValidCardId(args.id)) return { removed };
       const stores = [
         this.projects.get(args.projectSlug ?? '') ?? null,
         this.global,
@@ -406,6 +436,55 @@ export class MemoryCore {
     return { removed };
   }
 
+  /**
+   * Forget one exact card in one exact store (GUI path, v2). Strictly
+   * store-scoped — unlike {@link forget} it never falls through to another
+   * store. False when the store or the card is unknown.
+   */
+  async forgetCardIn(
+    slug: string,
+    id: string,
+    hard: boolean,
+    via: AuditVia,
+    sessionId?: string,
+  ): Promise<'archived' | 'hard-deleted' | null> {
+    const store = this.storeBySlug(slug);
+    if (store === null) return null;
+    const card = await store.readCard(id);
+    if (card === null) return null;
+    if (hard) {
+      const ok = await store.deleteCardHard(id);
+      if (ok) {
+        await store.audit({ ts: new Date().toISOString(), store: store.slug, op: 'hard-delete', id, via, session: sessionId });
+        await store.rebuildIndex();
+        return 'hard-deleted';
+      }
+      return null;
+    }
+    const ok = await store.archiveCard(id);
+    if (ok) {
+      await store.audit({ ts: new Date().toISOString(), store: store.slug, op: 'archive', id, via, session: sessionId });
+      await store.rebuildIndex();
+      return 'archived';
+    }
+    return null;
+  }
+
+  /**
+   * Restore one archived card to its store (GUI path, v2). False when the
+   * store is unknown, the card is not archived there, or a live card already
+   * occupies its id.
+   */
+  async restoreCardIn(slug: string, id: string, via: AuditVia, sessionId?: string): Promise<boolean> {
+    const store = this.storeBySlug(slug);
+    if (store === null) return false;
+    const ok = await store.restoreCard(id);
+    if (!ok) return false;
+    await store.audit({ ts: new Date().toISOString(), store: store.slug, op: 'restore', id, via, session: sessionId });
+    await store.rebuildIndex();
+    return true;
+  }
+
   // ── status ──────────────────────────────────────────────────────────────
 
   async status(enabled: boolean): Promise<StatusReport> {
@@ -414,7 +493,10 @@ export class MemoryCore {
     for (const store of this.allStores()) {
       const index = await store.readIndex().catch(() => null);
       const state = await store.readState().catch(() => null);
-      const pending = await store.inboxLineCount().catch(() => 0);
+      // PENDING inbox = lines not yet consumed by Dream (the file is never
+      // cleaned, so the raw line count would grow forever after each run).
+      const totalLines = await store.inboxLineCount().catch(() => 0);
+      const pending = Math.max(0, totalLines - (state?.inboxOffset ?? 0));
       const archived = await store.archivedCount().catch(() => 0);
       const projectPath = store.kind === 'project' ? await this.projectPathOf(store.slug) : undefined;
       stores.push({

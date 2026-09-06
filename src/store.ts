@@ -11,7 +11,7 @@
  */
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
-import { withFileLock } from '@deepseek-ai/dsh-atomic-write';
+import { writeFileAtomic, withFileLock } from '@deepseek-ai/dsh-atomic-write';
 import { healOrphanLock, isLockTimeout } from './lockheal.ts';
 import type {
   AuditEntry,
@@ -28,11 +28,11 @@ import {
   ensureDir,
   listFiles,
   mtimeMsSafe,
-  readJsonlLines,
+  readJsonlLinesLenient,
   readTextSafe,
   writeJsonAtomic,
 } from './fsutil.ts';
-import { cardDigest, cardIdFromFileName, cardTokenCount, readCardFile, serializeCard, writeCardFile } from './cards.ts';
+import { cardDigest, cardIdFromFileName, parseCard, readCardFile, serializeCard, writeCardFile } from './cards.ts';
 import { tokenize } from './retrieval.ts';
 
 export interface StoreLogger {
@@ -47,6 +47,14 @@ const EMPTY_STATE: DreamState = {
   lastResult: null,
   stats: { runs: 0, added: 0, updated: 0, archived: 0, blocked: 0 },
 };
+
+/**
+ * Store-lock wait budget. The dsh-atomic-write default is 2 s, which is tight
+ * for the heaviest critical section here — a full index rebuild over hundreds
+ * of cards on a cold FS. A lock held by a LIVE process is never stolen either
+ * way; this only widens the window before a live-holder wait gives up.
+ */
+const STORE_LOCK_WAIT_MS = 10_000;
 
 export class MemoryStore {
   readonly kind: 'global' | 'project';
@@ -82,10 +90,10 @@ export class MemoryStore {
    */
   private async lockedOn<T>(lockBase: string, op: () => Promise<T>): Promise<T> {
     try {
-      return await withFileLock(lockBase, op);
+      return await withFileLock(lockBase, op, { waitMs: STORE_LOCK_WAIT_MS });
     } catch (err) {
       if (isLockTimeout(err) && (await healOrphanLock(`${lockBase}.lock`))) {
-        return await withFileLock(lockBase, op);
+        return await withFileLock(lockBase, op, { waitMs: STORE_LOCK_WAIT_MS });
       }
       throw err;
     }
@@ -125,6 +133,11 @@ export class MemoryStore {
     }
   }
 
+  /** One warning per corrupt card file version (the dedup lives in cards.ts). */
+  private cardWarn = (msg: string): void => {
+    this.logger?.warn(msg);
+  };
+
   /** Rebuild index.json from the card files (under the store lock). */
   async rebuildIndex(): Promise<MemoryIndex> {
     return await this.locked(async () => {
@@ -135,8 +148,8 @@ export class MemoryStore {
       for (const name of names) {
         const id = cardIdFromFileName(name);
         if (id === null) continue;
-        const card = await readCardFile(this.paths.cards, id);
-        if (card === null) continue; // unreadable card: skip, keep the rest
+        const card = await readCardFile(this.paths.cards, id, this.cardWarn);
+        if (card === null) continue; // unreadable/corrupt card: skip, keep the rest
         const tokens = tokenize(`${card.title}\n${card.body}`);
         totalTokens += tokens.length;
         for (const t of new Set(tokens)) df[t] = (df[t] ?? 0) + 1;
@@ -184,7 +197,7 @@ export class MemoryStore {
     const index = await this.readIndex();
     const out = new Map<string, { meta: CardMeta; tokens: string[] }>();
     for (const [id, meta] of Object.entries(index.cards)) {
-      const card = await readCardFile(this.paths.cards, id);
+      const card = await readCardFile(this.paths.cards, id, this.cardWarn);
       if (card === null) continue;
       out.set(id, { meta, tokens: tokenize(`${card.title}\n${card.body}`) });
     }
@@ -193,19 +206,23 @@ export class MemoryStore {
 
   // ── cards ────────────────────────────────────────────────────────────────
 
+  /**
+   * Read one card; null when absent or corrupt. `rebuild: false` callers
+   * (Dream passes) batch the index refresh into a single end-of-run rebuild.
+   */
   async readCard(id: string): Promise<MemoryCard | null> {
-    return await readCardFile(this.paths.cards, id);
+    return await readCardFile(this.paths.cards, id, this.cardWarn);
   }
 
-  /** Atomically write one card and refresh the index. */
-  async putCard(card: MemoryCard): Promise<void> {
+  /** Atomically write one card and (by default) refresh the index. */
+  async putCard(card: MemoryCard, opts?: { rebuild?: boolean }): Promise<void> {
     await this.locked(async () => {
       await writeCardFile(this.paths.cards, card);
     });
-    await this.rebuildIndex();
+    if (opts?.rebuild !== false) await this.rebuildIndex();
   }
 
-  /** Patch mutable fields on an existing card; null when absent. */
+  /** Patch mutable fields on an existing card; null when absent or corrupt. */
   async patchCard(
     id: string,
     patch: Partial<
@@ -221,16 +238,17 @@ export class MemoryStore {
         | 'lastAccessed'
       >
     >,
+    opts?: { rebuild?: boolean },
   ): Promise<MemoryCard | null> {
     const card = await this.locked(async () => {
-      const existing = await readCardFile(this.paths.cards, id);
+      const existing = await readCardFile(this.paths.cards, id, this.cardWarn);
       if (existing === null) return null;
       Object.assign(existing, patch);
       await writeCardFile(this.paths.cards, existing);
       return existing;
     });
     // Same pattern as putCard: rebuild OUTSIDE the lock (rebuildIndex takes it).
-    if (card !== null) await this.rebuildIndex();
+    if (card !== null && opts?.rebuild !== false) await this.rebuildIndex();
     return card;
   }
 
@@ -262,15 +280,101 @@ export class MemoryStore {
     return deleted;
   }
 
+  /**
+   * Move an archived card back to cards/ (inverse of {@link archiveCard}).
+   * False when the archive entry is absent, fails to parse, or a live card
+   * already occupies the id. The move is under the store lock; the caller
+   * audits and rebuilds the index.
+   */
+  async restoreCard(id: string): Promise<boolean> {
+    return await this.locked(async () => {
+      const src = join(this.paths.archive, `${id}.md`);
+      const dest = join(this.paths.cards, `${id}.md`);
+      const text = await readTextSafe(src);
+      if (text === null) return false;
+      // Never promote a corrupt or id-mismatched file back to live.
+      try {
+        parseCard(text, id);
+      } catch (err) {
+        this.logger?.warn(`[dsh-memory] ${this.slug}: archive entry ${id} will not restore: ${(err as Error).message}`);
+        return false;
+      }
+      const destExists = await mtimeMsSafe(dest);
+      if (destExists !== null) return false; // live card already owns the id
+      const { writeFileAtomic } = await import('@deepseek-ai/dsh-atomic-write');
+      await writeFileAtomic(dest, text, { mode: 0o600 });
+      await fs.unlink(src);
+      return true;
+    });
+  }
+
+  /** One archived card row for browsing: id + archive time (file mtime), newest first. */
+  async listArchived(): Promise<{ id: string; archivedAt: string }[]> {
+    const names = await listFiles(this.paths.archive);
+    const out: { id: string; archivedAt: string }[] = [];
+    for (const name of names) {
+      const id = cardIdFromFileName(name);
+      if (id === null) continue;
+      const mtime = await mtimeMsSafe(join(this.paths.archive, name));
+      if (mtime !== null) out.push({ id, archivedAt: new Date(mtime).toISOString() });
+    }
+    out.sort((a, b) => (a.archivedAt < b.archivedAt ? 1 : a.archivedAt > b.archivedAt ? -1 : 0));
+    return out;
+  }
+
+  /** Read one archived card (browse view); null when absent or corrupt. */
+  async readArchivedCard(id: string): Promise<MemoryCard | null> {
+    return await readCardFile(this.paths.archive, id, this.cardWarn);
+  }
+
   // ── inbox / audit / access ───────────────────────────────────────────────
 
   async pushInbox(entry: InboxEntry): Promise<void> {
     await appendJsonl(this.paths.inbox, [entry]);
   }
 
+  /**
+   * Read inbox entries from an offset, leniently: a malformed line (a partial
+   * JSON left by a killed append) is skipped and reported by its 1-based
+   * non-empty line number, so the caller can quarantine it and still advance
+   * the offset past it instead of the read throwing.
+   *
+   * The offset counts EVERY non-empty line (good + malformed), but the lenient
+   * reader returns only the parseable ones — so the slice point is the offset
+   * MINUS the malformed lines at-or-before it, otherwise an already-quarantined
+   * bad line would shift the parseable array and make the next good line
+   * invisible to ingest.
+   */
+  async readInboxFrom(fromLine: number): Promise<{ entries: InboxEntry[]; malformedLines: number[] }> {
+    const { entries, malformedLines } = await readJsonlLinesLenient<InboxEntry>(this.paths.inbox);
+    const malformedAtOrBefore = malformedLines.filter((n) => n <= fromLine).length;
+    const skip = Math.max(0, fromLine - malformedAtOrBefore);
+    return { entries: entries.slice(skip), malformedLines: malformedLines.filter((n) => n > fromLine) };
+  }
+
   async readInbox(fromLine = 0): Promise<InboxEntry[]> {
-    const all = await readJsonlLines<InboxEntry>(this.paths.inbox);
-    return all.slice(fromLine);
+    const { entries } = await this.readInboxFrom(fromLine);
+    return entries;
+  }
+
+  /**
+   * Drop the first `dropLines` non-empty lines (the consumed head) so the
+   * file stays bounded at `budget.maxInboxLines`. Runs under the SAME lock as
+   * `pushInbox` appends, so it cannot interleave with or lose a concurrent
+   * append; callers must cap the drop at the consumed offset — pending lines
+   * are never dropped.
+   */
+  async compactInbox(dropLines: number): Promise<void> {
+    if (dropLines <= 0) return;
+    await this.lockedOn(this.paths.inbox, async () => {
+      const text = await readTextSafe(this.paths.inbox);
+      if (text === null) return;
+      const lines = text.split('\n').filter((l) => l.trim() !== '');
+      if (lines.length === 0) return;
+      const kept = lines.slice(dropLines);
+      if (kept.length === lines.length) return;
+      await writeFileAtomic(this.paths.inbox, kept.length > 0 ? kept.join('\n') + '\n' : '', { mode: 0o600 });
+    });
   }
 
   async inboxLineCount(): Promise<number> {
@@ -289,8 +393,10 @@ export class MemoryStore {
     await appendJsonl(this.paths.access, [{ ts: new Date().toISOString(), ids }]);
   }
 
+  /** Lenient: a torn access-log line must not fail a whole Dream run. */
   async readAccessLog(): Promise<{ ts: string; ids: string[] }[]> {
-    return await readJsonlLines<{ ts: string; ids: string[] }>(this.paths.access);
+    const { entries } = await readJsonlLinesLenient<{ ts: string; ids: string[] }>(this.paths.access);
+    return entries;
   }
 
   /** Truncate the access log (Dream consumes it). */

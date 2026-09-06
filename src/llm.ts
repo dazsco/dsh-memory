@@ -94,31 +94,44 @@ export async function callMemoryLlm(deps: MemoryLlmDeps, request: MemoryLlmReque
       signal: callDeadline.signal,
     });
     const assembler = new BlockAssembler();
-    const stream = llm.stream(options);
+    // ONE iterator for the whole call: re-entering Symbol.asyncIterator on
+    // the cancel path would ask the stream implementation for a second,
+    // parallel drain of the same resource.
+    const iterator = llm.stream(options)[Symbol.asyncIterator]();
     let streamDone = false;
     // A stalled stream (no chunks and no close — observed on the flaky
-    // ztu-ai endpoint) would suspend the for-await forever even after the
+    // ztu-ai endpoint) would suspend the drain forever even after the
     // deadline aborts the signal, because throwIfAborted only runs when a
     // chunk arrives. Race the drain against the deadline so this call is
     // always bounded by live.timeoutMs.
+    const drain = (async () => {
+      for (;;) {
+        const step = await iterator.next();
+        if (step.done) break;
+        callDeadline.signal.throwIfAborted();
+        assembler.push(step.value);
+      }
+      streamDone = true;
+    })();
     await Promise.race([
-      (async () => {
-        for await (const chunk of stream) {
-          callDeadline.signal.throwIfAborted();
-          assembler.push(chunk);
-        }
-        streamDone = true;
-      })(),
+      drain,
       new Promise<void>((resolve) => {
         if (callDeadline.signal.aborted) return resolve();
         callDeadline.signal.addEventListener('abort', () => resolve(), { once: true });
       }),
     ]);
     if (!streamDone) {
-      // The deadline won: best-effort cancel of the stalled stream (not
-      // awaited — cancelling may itself hang on the dead socket; the call is
-      // already bounded) and report the coded timeout via the existing catch.
-      void stream[Symbol.asyncIterator]().return?.().catch(() => undefined);
+      // The deadline won: the drain is still pending (or rejected) — attach a
+      // no-op catch so neither becomes an unhandled rejection, then
+      // best-effort cancel of the SAME iterator (not awaited — cancelling may
+      // itself hang on the dead socket; the call is already bounded) and
+      // report the coded timeout via the existing catch.
+      drain.catch(() => undefined);
+      try {
+        void iterator.return?.().catch(() => undefined);
+      } catch {
+        // a broken iterator's return() threw synchronously — nothing else to do
+      }
       callDeadline.signal.throwIfAborted();
     }
     const finish = assembler.finish;

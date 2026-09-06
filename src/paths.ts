@@ -11,9 +11,11 @@
  * written into the project directory itself.
  */
 import { promises as fs } from 'node:fs';
-import { join, dirname, sep } from 'node:path';
+import { join, dirname } from 'node:path';
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
+import { withFileLock } from '@deepseek-ai/dsh-atomic-write';
 import { ensureDir, readJsonSafe, writeJsonAtomic } from './fsutil.ts';
+import { healOrphanLock, isLockTimeout } from './lockheal.ts';
 import { MemorySchema } from './schema.ts';
 
 export function memoryRoot(): string {
@@ -94,33 +96,55 @@ export async function saveProjectsRegistry(reg: ProjectsRegistry): Promise<void>
 /**
  * Register a project path and return its slug, creating the store skeleton
  * on first sight. Collisions (same slug, different path) get -2, -3, …
+ *
+ * The whole read-modify-write runs under the registry lock (with orphan
+ * recovery): without it, two processes registering colliding paths at once
+ * would each read the old registry and last-writer-wins would lose the other
+ * entry — splitting one project's memory across two slugs.
  */
 export async function registerProjectPath(projectPath: string): Promise<{ slug: string; storeRoot: string; created: boolean }> {
-  const reg = await loadProjectsRegistry();
-  // Same path already registered?
-  for (const entry of Object.values(reg.projects)) {
-    if (entry.path === projectPath) {
-      entry.lastSeen = new Date().toISOString();
-      await saveProjectsRegistry(reg);
-      await ensureStoreSkel(projectStoreRoot(entry.slug));
-      return { slug: entry.slug, storeRoot: projectStoreRoot(entry.slug), created: false };
+  // The registry's lock sibling needs the memory root to exist (withFileLock
+  // does not create parent directories).
+  await ensureDir(memoryRoot());
+  const lockBase = projectsRegistryPath();
+  const register = async (): Promise<{ slug: string; created: boolean }> => {
+    const reg = await loadProjectsRegistry();
+    // Same path already registered?
+    for (const entry of Object.values(reg.projects)) {
+      if (entry.path === projectPath) {
+        entry.lastSeen = new Date().toISOString();
+        await saveProjectsRegistry(reg);
+        return { slug: entry.slug, created: false };
+      }
+    }
+    let base = slugForPath(projectPath);
+    let slug = base;
+    let n = 2;
+    while (
+      reg.projects[slug] !== undefined &&
+      reg.projects[slug]!.path !== projectPath
+    ) {
+      slug = `${base}-${n++}`;
+    }
+    const now = new Date().toISOString();
+    reg.projects[slug] = { path: projectPath, slug, firstSeen: now, lastSeen: now };
+    await saveProjectsRegistry(reg);
+    return { slug, created: true };
+  };
+  let slug: string;
+  let created: boolean;
+  try {
+    ({ slug, created } = await withFileLock(lockBase, register));
+  } catch (err) {
+    if (isLockTimeout(err) && (await healOrphanLock(`${lockBase}.lock`))) {
+      ({ slug, created } = await withFileLock(lockBase, register));
+    } else {
+      throw err;
     }
   }
-  let base = slugForPath(projectPath);
-  let slug = base;
-  let n = 2;
-  while (
-    reg.projects[slug] !== undefined &&
-    reg.projects[slug]!.path !== projectPath
-  ) {
-    slug = `${base}-${n++}`;
-  }
-  const now = new Date().toISOString();
-  reg.projects[slug] = { path: projectPath, slug, firstSeen: now, lastSeen: now };
-  await saveProjectsRegistry(reg);
   const storeRoot = projectStoreRoot(slug);
   await ensureStoreSkel(storeRoot);
-  return { slug, storeRoot, created: true };
+  return { slug, storeRoot, created };
 }
 
 /** Create the fixed subdirectories of a store (idempotent). */
@@ -157,5 +181,3 @@ export function storePathsFor(storeRoot: string) {
     lock: join(storeRoot, '.store.lock'),
   };
 }
-
-export const SEP = sep;

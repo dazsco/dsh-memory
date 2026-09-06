@@ -1,7 +1,7 @@
 # dsh-memory
 
 Durable memory for DeepSeek Harness (DSH): **global memory + per-project memory + rules layer + background "Dream" consolidation**.
-Production-grade: 63/63 tests green, end-to-end acceptance passed in the web profile. (中文说明见 [README.zh.md](README.zh.md))
+Production-grade: 118/118 tests green, end-to-end acceptance passed in the web profile. (中文说明见 [README.zh.md](README.zh.md))
 
 ## Design
 
@@ -52,12 +52,24 @@ The policy gate runs before anything is staged, so the candidate pool only ever 
 ### Secrets & privacy
 
 - **The built-in secret gate is always on and cannot be configured**: API keys, passwords, tokens, private keys, etc. are blocked pre-write and returned as a structured `blocked` result (never persisted, never thrown, never echoed). Accepted live: a fake OpenAI-style key → `{"blocked":true,"reason":"openai-style-key"}`.
-- `redact.pii`: `off | warn (audit only) | redact (default, mask in stored text)`.
+- `redact.pii`: `off | warn (audit only) | redact (default, mask in stored text)` — the policy covers every write path: auto-capture, Dream ingest **and** explicit `memory_remember` tool writes (the stored card text is the gated text).
 - Audit files are append-only and record card ids + actions, never content; every write is atomic (temp+rename); concurrent writes never lose data.
+- **Failure containment**: one corrupt card file is skipped (with a single warning) instead of bricking recall/status/Dream; a torn inbox or access-log line is skipped and — for the inbox — quarantined (audited `op: quarantine`, offset advances past it), so a kill -9 mid-append can never wedge the store.
 
 ### Rules layer
 
 - `## Memory` sections in the user-level `$DSH_HOME/AGENTS.md` and project-level `AGENTS.md`/`CLAUDE.md` may define deny rules (e.g. `deny: salary`). They stack on top of the policy gate and may only be stricter — they can never weaken the secret gate.
+
+### Memory page (GUI)
+
+The agent tools can only see the current project + global store — other project stores are invisible to the tool path. The Memory page closes that gap:
+
+- **Entry**: Settings → Memory (a standalone settings-nav page, the `settings.section` slot, order 25).
+- **Browsing**: every store (global + all projects, with card / pending / archived counts), per-store search (BM25 + tag boost, the same scoring as recall), full card detail (every front-matter field), the pending-capture inbox (only unconsumed lines — what the next Dream run will actually ingest), the archive listing, and Dream state + "Dream now" (reuses the `dream.requestSeq` trigger).
+- **Per-card management (v2, strictly through the existing write paths)**: the detail panel offers "Archive" and "Delete" (two-step confirm; delete is labelled irreversible), and the archive tab offers "Restore". These mutations are NOT a new raw write path — they call the SAME store ops the agent tools use (`core.forgetCardIn` → `store.archiveCard` / `deleteCardHard`; `core.restoreCardIn` → `store.restoreCard`), each under the store lock as an atomic move, each audited (`op: archive/hard-delete/restore`, `via: 'client'`). The single-writer discipline and the Dream pipeline invariants are untouched.
+- **Strict store scoping**: a GUI mutation only ever touches the store it names — no fall-through to global; unknown store/card → 404, malformed id/body → 400.
+- **Transport**: the Host registers seven exact routes (`/api/memory/summary|cards|card|inbox|archive` GET + `/api/memory/card/forget|restore` POST) on the connection channel — the same mechanism as session-log-export and file-upload; the browser reaches them through the connection's auth. Without the `connection` service (headless profiles) the routes degrade to absent with a single warning.
+- **Exposure**: only already-stored content is served (it passed the secret gate / PII policy before landing on disk, and the session brief already injects cards into model context); audit content is never served. Route failures: 400/404/500 + a generic message; details stay in the Host log.
 
 ## Install
 
@@ -82,7 +94,7 @@ The composition row can override the auxiliary LLM route:
 
 | Tool | Purpose |
 | --- | --- |
-| `memory_remember` | Store one durable memory (fact/preference/decision/procedure/commitment), scope `project`/`global`/`auto` |
+| `memory_remember` | Store one durable memory (fact/preference/decision/procedure/commitment/observation/summary), scope `project`/`global`/`auto`; honors the live `redact.pii` policy and reports masked categories as `piiWarnings` |
 | `memory_recall` | Recall project + global memories for a query |
 | `memory_forget` | Archive (default) or hard-delete by id or top-3 query match |
 | `memory_status` | Store counts, archived count, inbox, last Dream run |
@@ -105,21 +117,22 @@ The composition row can override the auxiliary LLM route:
 | `dream.requestSeq` | `0` | GUI "Dream now" monotonic trigger |
 | `brief.enabled` / `maxBytes` | `true` / `4096` | session brief switch / injected byte cap |
 | `brief.projectK` / `globalK` | `12` / `8` | max project / global memories injected |
-| `budget.maxCardBytes` / `maxInboxLines` | `4096` / `1000` | per-card byte cap / inbox line cap |
-| `llm.provider` / `model` | `''` | empty = composition-row route; overrides provider/model |
-| `llm.maxOutputTokens` / `timeoutMs` | `600` / `30000` | per auxiliary call: output cap / deadline |
+| `budget.maxCardBytes` / `maxInboxLines` | `4096` / `1000` | per-card byte cap / inbox line cap (Dream compacts the **consumed** head after each run; the unconsumed tail is never dropped) |
+| `llm.provider` / `model` | `''` | per-field override. Resolution order, first non-empty per field: ① this setting → ② the session's live default model (`agent-default-model` namespace, so the plugin rides the route the agent itself uses) → ③ the composition-row `llm:` route as last resort |
+| `llm.maxOutputTokens` / `timeoutMs` | `2000` / `60000` | per auxiliary call: output cap / deadline |
 
 ## Development
 
 ```powershell
 npm install
-npm run build      # esbuild: lib/index.js (host) + lib/testing.js + lib/client.js (GUI settings card)
+npm run build      # esbuild: lib/index.js (host) + lib/testing.js + lib/client.js (GUI settings card + Memory page)
 npm run typecheck
-npm test           # node --test tests/*.test.mjs (63 tests)
+npm test           # node --test tests/*.test.mjs (118 tests)
 ```
 
-- `src/` is the host plane (store/capture/recall/dream/tools/brief/settings); `src/client/` is the browser plane (settings card in the `settings.plugin.item` slot).
-- All LLM work goes through the injected `llm` service with hard deadlines; **no LLM failure is ever fatal**; tools return anonymous JSON-safe literals.
+- `src/` is the host plane (store/capture/recall/dream/tools/brief/settings/browse); `src/client/` is the browser plane (settings card in the `settings.plugin.item` slot + the Memory page in the `settings.section` slot — browse + per-card archive/delete/restore).
+- All LLM work goes through the injected `llm` service with hard deadlines; **no LLM failure is ever fatal** (a stalled stream is bounded by the per-call deadline and the single stream iterator is cancelled, never re-entered); tools return anonymous JSON-safe literals.
+- npm is the canonical package manager (`package-lock.json`); line endings are pinned to LF by `.gitattributes`.
 
 ## Acceptance record (web profile, 2026-08-17)
 
@@ -130,3 +143,22 @@ npm test           # node --test tests/*.test.mjs (63 tests)
 - Dream: `memory_dream` in the live process finished in 35 ms, wrote the `lastDream` checkpoint, idempotent.
 - Secret gate: a fake key was blocked (`blocked:true`) and never persisted.
 - Session brief: agent sessions in the fresh process received the memory `<system-reminder>` section.
+
+## Acceptance record (browse surface, 2026-09-05)
+
+- Tests: 99/99 pass. 8 browse cases (summary dual-store counts / enabled does not gate reads / card recency order + query ranking + limit paging / detail + 404 + 400 / inbox count + truncation / 7-route registration and disposal / absent-connection degradation / failed-registration rollback) + 3 per-card cases (archive→restore round trip + audit via=client / hard-delete is unrecoverable + audit / strict store scoping + 404/400 rejections).
+- Build: `lib/index.js` (host) + `lib/client.js` (settings card + Memory page) compile; `tsc --noEmit` clean.
+- Routes: the seven `/api/memory/*` exact routes (5 GET + 2 POST) mount on the row fiber via `connection.fetch.register` and unload with it; an absent `connection` or a failed registration degrades to a warning and never throws into an agent turn.
+- Write paths: archive / delete / restore all reuse the existing store ops (atomic move under the lock + audit + index rebuild); no new raw write. `restore` is a new audit op folded into the `AuditOp` union.
+- End-to-end (Settings → Memory page rendering + live data + the archive/delete/restore click flow) needs a manual check after a web-profile restart; this record covers the host route layer and the client bundle layer.
+
+## Acceptance record (resilience hardening, 2026-09-06)
+
+Audit-driven fixes (see `docs/AUDIT.md`, findings F1–F17); no behavior outside the listed findings changed.
+
+- Tests: 118/118 pass (99 baseline + 19 new regression cases: corrupt card ×3, malformed inbox quarantine ×2, quarantine offset alignment, inbox compaction, pending-inbox semantics, redact.pii modes ×4, forget id validation, registry race, registry no-rewrite, deferred index rebuild, no-LLM capture audit ×2, PII near-miss negatives; plus one existing stalled-stream case strengthened to assert the single iterator is cancelled exactly once).
+- Hardening: corrupt card files skip with one warning (no bricking); torn JSONL lines skip; malformed inbox lines quarantine (audited, offset advances); `budget.maxInboxLines` enforced by compaction of the consumed head only; `pendingInbox` = unconsumed lines everywhere; `redact.pii` honored on explicit remember writes (stored text is the gated text); `forget`/browse reject malformed and traversal ids (400/no-op, never a filesystem probe); project registry RMW is lock-serialized with orphan-lock healing and the slug is cached per process (no rewrite storm); the capture LLM pass skips the per-turn audit line when the service is absent; stalled LLM streams are deadline-bounded on a single iterator; store locks wait 10 s (was 2 s) for the rebuild critical section.
+- Dead code removed (F11): the unimplemented "promotion" feature (`promotionEligible`, `promoteSessions` rules, `op: 'promote'`, `loadAgentRules`) is gone; AGENTS.md `### 晋升` sections fall back to free-form notes. `AuditOp` gains `quarantine`.
+- Docs: settings table corrected to the real defaults (`llm.maxOutputTokens` 2000, `timeoutMs` 60000) and the three-stage LLM route resolution; the Memory page copy no longer claims read-only.
+- Hygiene: `pnpm-lock.yaml` removed (npm canonical), `.gitattributes` pins LF.
+- `npm run typecheck` clean; `npm run build` → lib/index.js + lib/testing.js + lib/client.js.

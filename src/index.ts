@@ -14,6 +14,9 @@
  *   5. turn-end auto-capture (root sessions, gated before staging)
  *   6. session-start brief injection (one budgeted system-reminder per session)
  *   7. system-prompt usage section (order 150)
+ *   8. GUI browse + per-card management routes (/api/memory/*, 5 GET +
+ *      2 POST, via the connection service; absent connection degrades to
+ *      a warning)
  *
  * Every ctx hook is failure-contained: nothing here may throw into an agent
  * turn. All side effects belong to the caller's fiber.
@@ -31,6 +34,7 @@ import { registerMemoryTools } from './tools.ts';
 import { registerCapture } from './capture.ts';
 import { registerDream, type DreamEngine } from './dream.ts';
 import { buildBrief } from './brief.ts';
+import { registerBrowseRoutes } from './browse.ts';
 import type { MemoryLlmDeps, MemoryLlmService } from './llm.ts';
 
 /** Composition-row config (the row's `config.llm` section; the loader passes only `config:` to apply). */
@@ -52,7 +56,11 @@ Policy: secrets (keys, passwords, tokens, credentials) are blocked automatically
 
 interface AgentLike {
   id: string;
-  session?: { header?: { cwd?: string } } | null;
+  session?: {
+    header?: { cwd?: string } | null;
+    /** Persisted session event log — the replayed history on resume. */
+    snapshotEvents?: () => readonly unknown[];
+  } | null;
   inject?: (message: unknown) => void;
 }
 
@@ -180,6 +188,16 @@ export function apply(ctx: Context, config?: MemoryPluginConfig | null): void {
         registerBriefInjection(ctx, core, getSettings, logger);
         registerUsageSection(ctx, logger);
 
+        // GUI browse + per-card management surface (v2). Registers seven
+        // exact /api/memory/* fetch routes (5 GET + 2 POST) on the
+        // connection service; degrades to a warning when the service is
+        // absent or registration fails.
+        registerBrowseRoutes(ctx, {
+          core,
+          isEnabled: () => getSettings().enabled,
+          logger,
+        });
+
         // Client "Run now": the GUI bumps dream.requestSeq (monotonic); the
         // host watch fires a Dream run. One watcher, failure-contained.
         let lastSeq = getSettings().dream.requestSeq;
@@ -200,7 +218,44 @@ export function apply(ctx: Context, config?: MemoryPluginConfig | null): void {
   });
 }
 
-/** One budgeted <system-reminder> per session at startup (KV-cache stable). */
+/**
+ * Durable dedup: true when the session's persisted log already carries a
+ * dsh-memory injection — an `agent/inbox/spliced` event whose inserted
+ * message source is this plugin. The in-process `injected` set only spans
+ * one host lifetime; after a process restart a resumed session must not
+ * receive the session-start brief a second time, so the persisted log is
+ * the durable authority. Scans from the front and exits on first hit: the
+ * brief normally sits within the first handful of events, so the common
+ * resume costs O(1).
+ */
+function hasPersistedBrief(session: AgentLike['session']): boolean {
+  try {
+    const events = session?.snapshotEvents?.();
+    if (!Array.isArray(events)) return false;
+    for (const raw of events) {
+      const event = raw as { type?: unknown; data?: { inserted?: unknown } | null } | null;
+      if (!event || event.type !== 'agent/inbox/spliced') continue;
+      const inserted = event.data?.inserted;
+      if (!Array.isArray(inserted)) continue;
+      for (const message of inserted) {
+        const source = (message as { source?: { kind?: unknown; plugin?: unknown } | null } | null)?.source;
+        if (source && source.kind === 'plugin' && source.plugin === 'dsh-memory') return true;
+      }
+    }
+    return false;
+  } catch {
+    return false; // detection must never block the injection path
+  }
+}
+
+/**
+ * One budgeted <system-reminder> per session at startup (KV-cache stable).
+ * Dedup is two-layered: the in-process set covers the
+ * agent/created + agent/session-start double fire within one host
+ * lifetime; the persisted-log check covers resumes after a process
+ * restart, where the brief is already part of the durable history (and
+ * legacy sessions without one are still briefed on their first resume).
+ */
 function registerBriefInjection(
   ctx: Context,
   core: MemoryCore,
@@ -215,6 +270,7 @@ function registerBriefInjection(
       if (!agent || typeof agent.id !== 'string') return;
       if (injected.has(agent.id)) return;
       injected.add(agent.id);
+      if (hasPersistedBrief(agent.session)) return;
       void (async () => {
         try {
           const st = getSettings();

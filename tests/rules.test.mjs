@@ -19,6 +19,8 @@ test('parses a Chinese AGENTS.md Memory section', () => {
     '### 保留期',
     '- observation: 30 天',
     '',
+    // Promotion is not implemented (F11): its section falls back to free-form
+    // notes instead of a promoteSessions field.
     '### 晋升',
     '- 需要 2 个会话',
     '',
@@ -30,7 +32,8 @@ test('parses a Chinese AGENTS.md Memory section', () => {
   assert.deepEqual([...r.denyKeywords].sort(), ['内网 IP', '密码']);
   assert.deepEqual(r.alwaysNotes, ['用中文回复']);
   assert.equal(r.retention.observation, 30);
-  assert.equal(r.promoteSessions, 2);
+  assert.equal('promoteSessions' in r, false, 'promotion is not parsed (unimplemented)');
+  assert.ok(r.notes.includes('需要 2 个会话'), 'promotion lines fall back to notes');
   assert.ok(!JSON.stringify(r).includes('不应被读取'), 'content outside the section is ignored');
 });
 
@@ -55,11 +58,11 @@ test('no Memory section → null', () => {
   assert.equal(parseMemorySection('# A\n- x\n'), null);
 });
 
-test('mergeRules unions deny keywords; later retention wins; null promote does not override', () => {
-  const a = { denyKeywords: ['x'], alwaysNotes: [], retention: { observation: 30 }, promoteSessions: 1, notes: [] };
-  const b = { denyKeywords: ['y'], alwaysNotes: [], retention: { observation: 10 }, promoteSessions: null, notes: [] };
+test('mergeRules unions deny keywords; later retention wins', () => {
+  const a = { denyKeywords: ['x'], alwaysNotes: [], retention: { observation: 30 }, notes: [] };
+  const b = { denyKeywords: ['y'], alwaysNotes: [], retention: { observation: 10 }, notes: ['n'] };
   const m = mergeRules([a, b]);
   assert.deepEqual([...m.denyKeywords].sort(), ['x', 'y']);
   assert.equal(m.retention.observation, 10);
-  assert.equal(m.promoteSessions, 1);
+  assert.deepEqual(m.notes, ['n']);
 });

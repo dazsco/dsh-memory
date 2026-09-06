@@ -190,3 +190,136 @@ test('concurrent engines on the same store do not double-ingest (file lock)', as
     assert.equal(Object.keys(index.cards).length, 4, 'each capture ingested exactly once');
   });
 });
+
+// ── F4: a malformed inbox line must not wedge the store's Dream ────────────
+
+test('F4: a malformed inbox line is quarantined and skipped, not fatal', async () => {
+  await withDshHome(async (home) => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const store = core.global;
+    // Simulate a torn append (kill -9 mid-batch): two valid lines plus one
+    // partial JSON line, exactly as a half-flushed appendFile would leave it.
+    const good1 = JSON.stringify({ ts: iso(), content: '隔离测试甲：网关的生产端口是 8443。', source: { session: 's1', turn: null }, via: 'auto-heuristic' });
+    const torn = '{"ts":"2026-01-01T00:00:00.000Z","content":"broken half line","sourc';
+    const good2 = JSON.stringify({ ts: iso(), content: '隔离测试乙：数据库快照每周日凌晨生成。', source: { session: 's3', turn: null }, via: 'auto-heuristic' });
+    await writeFile(store.paths.inbox, `${good1}\n${torn}\n${good2}\n`, 'utf8');
+    // sanity: the strict reader throws on this file (the pre-fix wedge)
+    await assert.rejects(() => T.readJsonlLines(store.paths.inbox), T.MemoryFsError);
+
+    const engine = new T.DreamEngine(core, () => T.defaultMemorySettings(), null);
+    const r = await engine.runNow({ reason: 'test' });
+    const g = r.stores.find((s) => s.slug === 'global');
+    assert.equal(g.error, undefined, 'the run succeeds despite the malformed line');
+    assert.equal(g.added, 2, 'both good lines were ingested');
+    assert.ok(r.stores.find((s) => s.slug === 'global').notes.some((n) => n.includes('quarantined')), 'quarantine noted');
+
+    // the offset advanced PAST the bad line → isDirty is false, no retry loop
+    const state = await store.readState();
+    assert.equal(state.inboxOffset, await store.inboxLineCount(), 'offset covers every line incl. the bad one');
+    assert.equal(await engine.isDirty(), false, 'store is no longer dirty');
+    // and the second run is clean (no re-quarantine, no error)
+    const r2 = await engine.runNow({ reason: 'test' });
+    const g2 = r2.stores.find((s) => s.slug === 'global');
+    assert.equal(g2.error, undefined);
+    assert.ok(!g2.notes.some((n) => n.includes('quarantined')), 'second run has nothing to quarantine');
+
+    // the quarantine was audited (op=quarantine, via=system, no content)
+    const audit = await T.readJsonlLines(join(home, 'memory/global/audit.jsonl'));
+    const q = audit.find((e) => e.op === 'quarantine');
+    assert.ok(q, 'quarantine audited');
+    assert.equal(q.via, 'system');
+    assert.ok(!q.detail.includes('broken half line'), 'matched content never lands on disk');
+  });
+});
+
+test('F4: a torn ACCESS log line does not fail the Dream run', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const store = core.global;
+    const { card } = await core.remember({ content: '访问日志损坏测试卡片。', scope: 'global' }, 'tool', 's1');
+    await store.noteAccess([card.id]);
+    // append a torn half line (terminated, so the next append starts its own line)
+    const text = (await T.readTextSafe(store.paths.access)).replace(/\n+$/, '');
+    await writeFile(store.paths.access, `${text}\n{"ts":"2026-01-01T00:00:00.000Z","ids":["m-20260101-aaaabbbbcc\n`, 'utf8');
+    await store.noteAccess([card.id]);
+
+    const engine = new T.DreamEngine(core, () => T.defaultMemorySettings(), null);
+    const r = await engine.runNow({ reason: 'test' });
+    const g = r.stores.find((s) => s.slug === 'global');
+    assert.equal(g.error, undefined, 'torn access line is skipped, not fatal');
+    const after = await store.readCard(card.id);
+    assert.equal(after.accessCount, 2, 'the good access lines were folded');
+  });
+});
+
+test('F4: a quarantined line must not hide entries appended after it (offset alignment)', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const store = core.global;
+    const good1 = JSON.stringify({ ts: iso(), content: '对齐测试甲：网关端口 8443。', source: { session: 's', turn: null }, via: 'auto-heuristic' });
+    const torn = '{"ts":"2026-01-01T00:00:00.000Z","content":"half';
+    await writeFile(store.paths.inbox, `${good1}\n${torn}\n`, 'utf8');
+
+    // run 1: ingest good1, quarantine the torn line, offset advances past both
+    const engine = new T.DreamEngine(core, () => T.defaultMemorySettings(), null);
+    const r1 = await engine.runNow({ reason: 'test' });
+    const g1 = r1.stores.find((s) => s.slug === 'global');
+    assert.equal(g1.error, undefined);
+    assert.equal(g1.added, 1);
+    assert.equal((await store.readState()).inboxOffset, 2, 'offset covers the quarantined line');
+
+    // append a NEW entry after the quarantined line
+    await store.pushInbox({ ts: iso(), content: '对齐测试乙：数据库快照每周日。', source: { session: 's', turn: null }, via: 'auto-heuristic' });
+
+    // run 2: the new entry MUST be ingested (pre-fix the shifted slice hid it)
+    const r2 = await engine.runNow({ reason: 'test' });
+    const g2 = r2.stores.find((s) => s.slug === 'global');
+    assert.equal(g2.error, undefined);
+    assert.equal(g2.added, 1, 'entry appended after a quarantined line is not hidden');
+    const index = await store.readIndex();
+    assert.ok(Object.values(index.cards).some((c) => c.title.includes('对齐测试乙')), 'the appended card landed');
+  });
+});
+
+// ── F5: budget.maxInboxLines bounds the inbox file ─────────────────────────
+
+test('F5: inbox is compacted to budget.maxInboxLines after Dream (pending never dropped)', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const store = core.global;
+    const s = T.defaultMemorySettings();
+    s.budget.maxInboxLines = 10; // schema minimum
+
+    for (let i = 0; i < 15; i += 1) {
+      await store.pushInbox({ ts: iso(), content: `压缩测试 ${i}：各不相同的编号内容。`, source: { session: 's', turn: null }, via: 'auto-heuristic' });
+    }
+    const engine = new T.DreamEngine(core, () => s, null);
+    const r = await engine.runNow({ reason: 'test' });
+    const g = r.stores.find((s2) => s2.slug === 'global');
+    assert.equal(g.error, undefined);
+
+    // the file shrank to the cap, the offset was adjusted in lockstep
+    const state = await store.readState();
+    const total = await store.inboxLineCount();
+    assert.ok(total <= 10, `file bounded at the cap (was 15, now ${total})`);
+    assert.equal(state.inboxOffset, total, 'offset adjusted with the compaction');
+    // pending is consistent: every remaining line is consumed
+    const status = await core.status(true);
+    assert.equal(status.stores[0].pendingInbox, 0);
+
+    // a NEW capture is not dropped by the next run's compaction
+    await store.pushInbox({ ts: iso(), content: '压缩测试之后的新条目。', source: { session: 's', turn: null }, via: 'auto-heuristic' });
+    assert.equal(await store.inboxLineCount(), total + 1);
+    const r2 = await engine.runNow({ reason: 'test' });
+    const g2 = r2.stores.find((s2) => s2.slug === 'global');
+    assert.equal(g2.error, undefined);
+    const after = await store.readState();
+    assert.ok((await store.inboxLineCount()) - after.inboxOffset <= 10, 'file still bounded');
+    const index = await store.readIndex();
+    assert.ok(Object.values(index.cards).some((c) => c.title.includes('压缩测试之后')), 'the new pending line survived to ingest');
+  });
+});

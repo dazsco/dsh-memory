@@ -199,7 +199,8 @@ test('full wiring E2E against a fake ctx', async () => {
     // 6. brief injection on agent start (deduped across both events)
     const agent = {
       id: 'agent-1',
-      session: { id: 'sess-agent', header: { cwd: null } },
+      // A fresh session's persisted log is empty at agent start.
+      session: { id: 'sess-agent', header: { cwd: null }, snapshotEvents: () => [] },
       inject: (msg) => state.injected.push(msg),
     };
     emit(ctx, state, 'agent/created', { agent });
@@ -212,6 +213,63 @@ test('full wiring E2E against a fake ctx', async () => {
     assert.equal(msg.content[0].type, 'text');
     assert.ok(msg.content[0].text.startsWith('<system-reminder>'));
     assert.ok(msg.content[0].text.includes('8443'), 'brief carries the new memory');
+
+    // 6b. resume after a host restart must NOT re-inject the brief: for a
+    // new agent id the in-process set is empty, so only the durable
+    // persisted-log check (a spliced dsh-memory message already in the
+    // session history) can stop the double injection.
+    const persistedSplice = {
+      type: 'agent/inbox/spliced',
+      seq: 3,
+      data: {
+        target: 'next-step',
+        start: 0,
+        inserted: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: '<system-reminder>\nresumed brief\n</system-reminder>' }],
+            source: { kind: 'plugin', plugin: 'dsh-memory', form: 'recall' },
+          },
+        ],
+      },
+    };
+    const resumedAgent = {
+      id: 'agent-1-resumed',
+      session: {
+        id: 'sess-agent',
+        header: { cwd: null },
+        snapshotEvents: () => [
+          { type: 'permission/preset', seq: 0, data: { preset: 'danger-full-access' } },
+          persistedSplice,
+        ],
+      },
+      inject: (m) => state.injected.push(m),
+    };
+    emit(ctx, state, 'agent/created', { agent: resumedAgent });
+    emit(ctx, state, 'agent/session-start', { agent: resumedAgent, source: 'resume' });
+    // Give a (buggy) async injection path time to fire; the persisted check
+    // must prevent it synchronously.
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(state.injected.length, 1, 'resumed session with persisted brief is not re-injected');
+
+    // 6c. legacy session (persisted log WITHOUT any dsh-memory brief, e.g.
+    // created before the plugin existed) is still briefed on first resume.
+    const legacyAgent = {
+      id: 'agent-legacy',
+      session: {
+        id: 'sess-legacy',
+        header: { cwd: null },
+        snapshotEvents: () => [
+          { type: 'user/message', seq: 0, data: {} },
+          { type: 'turn/end', seq: 1, data: { reason: 'stop' } },
+        ],
+      },
+      inject: (m) => state.injected.push(m),
+    };
+    emit(ctx, state, 'agent/session-start', { agent: legacyAgent, source: 'resume' });
+    const legacyOk = await waitFor(() => state.injected.length === 2, { timeoutMs: 8000 });
+    assert.ok(legacyOk, `legacy session briefed on first resume (got ${state.injected.length})`);
+    assert.equal(state.injected[1].source.plugin, 'dsh-memory');
 
     // 7. global kill switch: settings.enabled=false disables the write/dream tools
     state.settingsScope.update({ enabled: false });

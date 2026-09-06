@@ -65,6 +65,31 @@ export async function readJsonlLines<T>(file: string): Promise<T[]> {
   return out;
 }
 
+/**
+ * Lenient JSONL read: ENOENT → empty; a malformed line is SKIPPED and
+ * reported by its 1-based non-empty line number instead of failing the read.
+ * A killed append can leave a half line (JSONL lines are newline-terminated,
+ * so a torn write leaves exactly one partial line); offset-tracking callers
+ * (Dream) quarantine those lines and advance past them.
+ */
+export async function readJsonlLinesLenient<T>(file: string): Promise<{ entries: T[]; malformedLines: number[] }> {
+  const text = await readTextSafe(file);
+  if (text === null) return { entries: [], malformedLines: [] };
+  const entries: T[] = [];
+  const malformedLines: number[] = [];
+  let no = 0; // 1-based non-empty line number
+  for (const raw of text.split('\n')) {
+    if (raw.trim() === '') continue;
+    no++;
+    try {
+      entries.push(JSON.parse(raw) as T);
+    } catch {
+      malformedLines.push(no);
+    }
+  }
+  return { entries, malformedLines };
+}
+
 /** List file names in a directory; ENOENT → []. */
 export async function listFiles(dir: string): Promise<string[]> {
   try {

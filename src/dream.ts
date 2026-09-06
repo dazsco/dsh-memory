@@ -31,6 +31,7 @@ import { cardStrength, jaccard, tokenize } from './retrieval.ts';
 import { dedupDecide, normalizeMemoryText } from './dedup.ts';
 import { makeCardId } from './cards.ts';
 import { listFiles } from './fsutil.ts';
+import { MEMORY_KINDS } from './types.ts';
 import type { DreamState, InboxEntry, MemoryCard, MemoryKind } from './types.ts';
 import type { MemorySettings } from './settings.ts';
 import {
@@ -239,14 +240,46 @@ export class DreamEngine {
         const state = await store.readState();
 
         // ── pass 1: ingest staged captures ────────────────────────────────
-        const entries = await store.readInbox(state.inboxOffset);
+        // Lenient read: a malformed line (torn append) is reported, not fatal —
+        // quarantined in-line below so one bad line can never wedge the store's
+        // Dream. The offset counts EVERY non-empty line (good + malformed), so
+        // the parseable entries and the malformed line numbers are merged into
+        // one position-ordered view; the offset advances by the number of view
+        // items actually processed.
+        const { entries, malformedLines } = await store.readInboxFrom(state.inboxOffset);
+        const malformedSet = new Set(malformedLines);
+        const inboxTotalLines = await store.inboxLineCount();
+        const view: Array<{ kind: 'entry'; entry: InboxEntry } | { kind: 'malformed'; lineNo: number }> = [];
+        {
+          let e = 0;
+          for (let p = state.inboxOffset + 1; p <= inboxTotalLines; p++) {
+            if (malformedSet.has(p)) view.push({ kind: 'malformed', lineNo: p });
+            else view.push({ kind: 'entry', entry: entries[e++]! });
+          }
+        }
         const corpus = await store.cardCorpus();
         let consumed = 0;
-        for (const entry of entries) {
+        for (const item of view) {
           if (Date.now() > deadline) {
             res.notes.push('wall budget exhausted; inbox resumes next run');
             break;
           }
+          if (item.kind === 'malformed') {
+            // A partial JSON line (kill -9 mid-append): quarantine — audit it
+            // and advance past it so the next run resumes after it. No content
+            // of the line is ever persisted.
+            res.notes.push(`quarantined inbox line ${item.lineNo} (unparseable)`);
+            await store.audit({
+              ts: nowIso(),
+              store: store.slug,
+              op: 'quarantine',
+              detail: `inbox line ${item.lineNo} unparseable; skipped`,
+              via: 'system',
+            });
+            consumed++;
+            continue;
+          }
+          const entry = item.entry;
           const rules = await this.core.rulesFor(store.slug);
           const gated = gateCandidate(entry.content, rules.denyKeywords, this.getSettings().redact.pii);
           if (!gated.ok) {
@@ -267,7 +300,8 @@ export class DreamEngine {
             res.noop++;
             const meta = corpus.get(decision.matchId)?.meta;
             if (meta) {
-              await store.patchCard(decision.matchId, { updated: nowIso(), confidence: Math.min(0.95, round2(meta.confidence + 0.02)) });
+              // rebuild: false — pass 5 rebuilds the index once for the run.
+              await store.patchCard(decision.matchId, { updated: nowIso(), confidence: Math.min(0.95, round2(meta.confidence + 0.02)) }, { rebuild: false });
             }
             consumed++;
             continue;
@@ -276,7 +310,8 @@ export class DreamEngine {
             res.updated++;
             const meta = corpus.get(decision.matchId)?.meta;
             if (meta) {
-              await store.patchCard(decision.matchId, { updated: nowIso(), confidence: Math.min(0.95, round2(meta.confidence + 0.05)) });
+              // rebuild: false — pass 5 rebuilds the index once for the run.
+              await store.patchCard(decision.matchId, { updated: nowIso(), confidence: Math.min(0.95, round2(meta.confidence + 0.05)) }, { rebuild: false });
             }
             res.notes.push(`update ${decision.matchId} (j≈${(decision.similarity ?? 0).toFixed(2)})`);
             await store.audit({ ts: nowIso(), store: store.slug, op: 'update', id: decision.matchId, detail: `dedup-jaccard ${decision.similarity?.toFixed(2)}`, via: 'dream' });
@@ -284,7 +319,7 @@ export class DreamEngine {
             continue;
           }
           const ts = nowIso();
-          const kind: MemoryKind = entry.kind && MEMORY_KINDS_LOCAL.has(entry.kind) ? entry.kind : 'fact';
+          const kind: MemoryKind = entry.kind && (MEMORY_KINDS as readonly string[]).includes(entry.kind) ? entry.kind : 'fact';
           const normText = normalizeMemoryText(gated.text);
           const card: MemoryCard = {
             id: makeCardId(now()),
@@ -304,7 +339,8 @@ export class DreamEngine {
             title: firstLine(normText),
             body: normText,
           };
-          await store.putCard(card);
+          // rebuild: false — pass 5 rebuilds the index once for the run.
+          await store.putCard(card, { rebuild: false });
           await store.audit({ ts, store: store.slug, op: 'create', id: card.id, detail: card.title.slice(0, 80), via: 'dream', session: entry.source?.session });
           const meta: import('./types.ts').CardMeta = {
             path: join(store.paths.cards, `${card.id}.md`),
@@ -327,6 +363,9 @@ export class DreamEngine {
           res.added++;
           consumed++;
         }
+        // The offset advances by exactly the view items processed (good lines
+        // ingested + malformed lines quarantined); anything past a wall-budget
+        // break stays for the next run.
         state.inboxOffset += consumed;
 
         // ── pass 2: fold access log into counters ──────────────────────────
@@ -345,7 +384,8 @@ export class DreamEngine {
           for (const [id, c] of counts) {
             const meta = index.cards[id];
             if (!meta) continue;
-            await store.patchCard(id, { accessCount: meta.accessCount + c.n, lastAccessed: c.last });
+            // rebuild: false — pass 5 rebuilds the index once for the run.
+            await store.patchCard(id, { accessCount: meta.accessCount + c.n, lastAccessed: c.last }, { rebuild: false });
           }
           await store.clearAccessLog();
         }
@@ -389,7 +429,8 @@ export class DreamEngine {
             .slice(0, 5)
             .map((x) => x.oid);
           if (JSON.stringify(best) !== JSON.stringify(c.meta.links)) {
-            const patched = await store.patchCard(id, { links: best });
+            // rebuild: false — pass 5 rebuilds the index once for the run.
+            const patched = await store.patchCard(id, { links: best }, { rebuild: false });
             if (patched) {
               c.meta.links = best;
               res.relinked++;
@@ -409,7 +450,23 @@ export class DreamEngine {
         }
 
         // ── pass 5: reindex (derived artifact) ─────────────────────────────
+        // Single rebuild for the whole run (every mutation above passed
+        // rebuild: false), so the run's index I/O is O(N), not O(N²).
         await store.rebuildIndex();
+
+        // ── inbox compaction (budget.maxInboxLines) ─────────────────────────
+        // Keep the inbox file bounded: drop the CONSUMED head once it grows
+        // past the cap. Pending (unconsumed) lines are never dropped — the
+        // drop is capped at the offset — and the offset is adjusted in the
+        // SAME checkpoint write below, so the pair can never disagree.
+        const maxInboxLines = this.getSettings().budget.maxInboxLines;
+        const totalLines = await store.inboxLineCount();
+        const dropLines = Math.min(Math.max(0, totalLines - maxInboxLines), state.inboxOffset);
+        if (dropLines > 0) {
+          await store.compactInbox(dropLines);
+          state.inboxOffset -= dropLines;
+          res.notes.push(`inbox compacted: dropped ${dropLines} consumed line(s)`);
+        }
 
         // ── checkpoint ─────────────────────────────────────────────────────
         state.lastRun = nowIso();
@@ -580,8 +637,6 @@ function firstLine(text: string): string {
   const line = (idx < 0 ? text : text.slice(0, idx)).trim();
   return line.length > 0 ? line : text.trim().slice(0, 120);
 }
-
-const MEMORY_KINDS_LOCAL = new Set(['fact', 'preference', 'decision', 'procedure', 'commitment', 'observation', 'summary']);
 
 async function writeReport(dreamDir: string, r: { slug: string; ts: string; res: StoreDreamResult; notes: string[] }): Promise<void> {
   const md = [

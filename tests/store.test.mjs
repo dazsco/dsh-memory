@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
+import { mkdir, stat, writeFile } from 'node:fs/promises';
 import { withDshHome, waitMs } from './helpers/tmp.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -124,5 +125,246 @@ test('cwd outside any project → no project store', async () => {
     const core = await T.MemoryCore.create({ logger: null });
     const store = await core.projectStoreForCwd(join(home, 'no-project-here'));
     assert.equal(store, null);
+  });
+});
+
+// ── F1: a single corrupt card file must not brick the store ────────────────
+
+test('F1: recall survives a corrupt card (skips it, keeps the rest)', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const { card: victimCard } = await core.remember({ content: '网关端口是 8443。', scope: 'global' }, 'tool', 's1');
+    const { card: healthyCard } = await core.remember({ content: '部署流水线用 GitHub Actions。', scope: 'global' }, 'tool', 's1');
+
+    const store = core.global;
+    // corrupt exactly the victim's file
+    await writeFile(join(store.paths.cards, `${victimCard.id}.md`), 'corrupted {{{ no frontmatter');
+
+    // recall must not throw and must still return the healthy card
+    const { hits, counts } = await core.recall('网关 部署', { k: 5 });
+    assert.ok(hits.some((h) => h.id === healthyCard.id), 'the healthy card is still recalled');
+    assert.ok(!hits.some((h) => h.id === victimCard.id), 'the corrupt card is not served');
+    assert.equal(counts.global, 1, 'corrupt card is out of the corpus');
+
+    // the index rebuild itself is resilient (used by status / browse)
+    const index = await store.rebuildIndex();
+    assert.equal(Object.keys(index.cards).length, 1);
+    assert.ok(index.cards[healthyCard.id], 'index holds the healthy card');
+  });
+});
+
+test('F1: writes and Dream still work with a corrupt card present', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const first = await core.remember({ content: '第一条记忆内容。', scope: 'global' }, 'tool', 's1');
+    const second = await core.remember({ content: '第二条记忆内容。', scope: 'global' }, 'tool', 's1');
+    const store = core.global;
+    // poison exactly one card; the other must stay fully functional
+    await writeFile(join(store.paths.cards, `${first.card.id}.md`), 'broken');
+
+    // a new remember still lands (the corrupt file does not block putCard)
+    const third = await core.remember({ content: '第三条记忆内容。', scope: 'global' }, 'tool', 's1');
+    assert.ok(third.card.id);
+
+    // recall still finds the healthy card
+    const { hits } = await core.recall('第二条记忆内容', { k: 5 });
+    assert.ok(hits.some((h) => h.id === second.card.id), 'healthy card still recalled');
+
+    // Dream ingests a new capture and succeeds despite the corrupt card
+    await store.pushInbox({ ts: new Date().toISOString(), content: 'Dream 期间新增的捕获。', source: { session: 's', turn: null }, via: 'auto-heuristic' });
+    const engine = new T.DreamEngine(core, () => T.defaultMemorySettings(), null);
+    const r = await engine.runNow({ reason: 'test' });
+    const g = r.stores.find((s) => s.slug === 'global');
+    assert.equal(g.error, undefined, 'dream run succeeds with a corrupt card on disk');
+    assert.ok(g.added >= 1, 'new capture ingested');
+
+    // the index holds only parseable cards
+    const index = await store.readIndex();
+    assert.equal(index.cards[first.card.id], undefined, 'corrupt card excluded from index');
+    assert.ok(index.cards[second.card.id], 'healthy card still indexed');
+  });
+});
+
+test('F1: corrupt archive entry is skipped, not resurrected by restore', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const { card } = await core.remember({ content: '待归档的记忆。', scope: 'global' }, 'tool', 's1');
+    await core.forget({ id: card.id }, 'tool', 's1');
+    // corrupt the archived copy
+    await writeFile(join(core.global.paths.archive, `${card.id}.md`), 'garbage');
+    // restore refuses to promote a corrupt file
+    assert.equal(await core.restoreCardIn('global', card.id, 'tool'), false);
+    // the archive listing still works (skips the unreadable entry)
+    const rows = await core.global.listArchived();
+    assert.ok(rows.some((r) => r.id === card.id), 'row remains listed by name');
+    assert.equal(await core.global.readArchivedCard(card.id), null, 'corrupt archive entry reads as null');
+  });
+});
+
+// ── F3: redact.pii is honored on the explicit remember path ────────────────
+
+test('F3: remember honors redact.pii = off (raw stored)', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const out = await core.remember({ content: '联系我邮箱 bob@example.com。', scope: 'global', piiMode: 'off' }, 'tool', 's1');
+    assert.equal(out.warnings.length, 0, 'off mode reports nothing');
+    assert.equal(await core.global.readCard(out.card.id).then((c) => c.body + c.title), '联系我邮箱 bob@example.com。');
+  });
+});
+
+test('F3: remember honors redact.pii = warn (raw stored + names reported)', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const out = await core.remember({ content: '联系我邮箱 bob@example.com。', scope: 'global', piiMode: 'warn' }, 'tool', 's1');
+    assert.deepEqual(out.warnings, ['email'], 'warn reports the category name, not the content');
+    assert.equal((await core.global.readCard(out.card.id)).title, '联系我邮箱 bob@example.com。', 'warn mode does not mask');
+  });
+});
+
+test('F3: remember defaults to redact (mask) when no piiMode is given', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const out = await core.remember({ content: '联系我邮箱 bob@example.com。', scope: 'global' }, 'tool', 's1');
+    assert.deepEqual(out.warnings, ['email'], 'masked categories are still named');
+    const card = await core.global.readCard(out.card.id);
+    assert.ok(!`${card.title} ${card.body}`.includes('bob@example.com'), 'default mode masks the email');
+  });
+});
+
+// ── F10: forget with a malformed / traversal id is a no-op, not a crash ────
+
+test('F10: forget rejects malformed and traversal ids (no-op, no throw)', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const { card } = await core.remember({ content: '受保护的记忆。', scope: 'global' }, 'tool', 's1');
+    for (const id of ['../../etc/passwd', '../global', 'nope', 'm-bad', `${card.id}.md`]) {
+      const out = await core.forget({ id }, 'tool', 's1');
+      assert.deepEqual(out.removed, [], `id ${JSON.stringify(id)} is a no-op`);
+    }
+    assert.ok(await core.global.readCard(card.id), 'the real card is untouched');
+  });
+});
+
+// ── F8: registry RMW is locked + the slug is cached per process ────────────
+
+test('F8: concurrent registrations of colliding paths lose no entry', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    // Two DIFFERENT project paths that slug to the SAME base (collision).
+    // Without the registry lock, parallel RMWs would last-writer-wins and
+    // drop one entry (splitting one project's memory across two slugs).
+    const { mkdtemp } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const base = await mkdtemp(join(tmpdir(), 'dsh-mem-reg-'));
+    try {
+      // Force a slug collision: slugForPath maps both "." and " " to "-", so
+      // these two DISTINCT paths slug to the SAME base.
+      const p1 = join(base, 'proj.a b');
+      const p2 = join(base, 'proj a.b');
+      assert.equal(T.slugForPath(p1), T.slugForPath(p2), 'fixture sanity: same base slug');
+      const [r1, r2] = await Promise.all([T.registerProjectPath(p1), T.registerProjectPath(p2)]);
+      assert.notEqual(r1.slug, r2.slug, 'colliding paths get distinct slugs');
+      const reg = await T.loadProjectsRegistry();
+      assert.equal(reg.projects[r1.slug].path, p1, 'first entry kept (no last-writer-wins loss)');
+      assert.equal(reg.projects[r2.slug].path, p2, 'second entry kept (no last-writer-wins loss)');
+    } finally {
+      const { rm } = await import('node:fs/promises');
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+});
+
+test('F8: projectStoreForCwd registers once, then never rewrites the registry', async () => {
+  await withDshHome(async (home) => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const proj = join(home, 'fake-project');
+    await mkdir(proj, { recursive: true });
+    await writeFile(join(proj, '.git'), 'fake');
+
+    const s1 = await core.projectStoreForCwd(proj);
+    assert.ok(s1);
+    const regPath = T.projectsRegistryPath();
+    const mtimeAfterFirst = (await stat(regPath)).mtimeMs;
+
+    // N more lookups (the recall/remember hot path) must not touch the file
+    for (let i = 0; i < 5; i += 1) {
+      const s = await core.projectStoreForCwd(join(proj, 'sub', 'dir'));
+      assert.equal(s?.slug, s1.slug, 'same store via a nested cwd');
+    }
+    await waitMs(20);
+    const mtimeAfterN = (await stat(regPath)).mtimeMs;
+    assert.equal(mtimeAfterN, mtimeAfterFirst, 'registry not rewritten on repeat lookups');
+  });
+});
+
+// ── F2: pending inbox = unconsumed lines only ──────────────────────────────
+
+test('F2: status pendingInbox counts only unconsumed lines (0 after Dream)', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const store = core.global;
+    for (let i = 0; i < 3; i += 1) {
+      await store.pushInbox({ ts: new Date().toISOString(), content: `捕获 ${i}`, source: { session: 's', turn: null }, via: 'auto-heuristic' });
+    }
+    const before = await core.status(true);
+    assert.equal(before.stores[0].pendingInbox, 3, '3 staged → 3 pending');
+
+    const engine = new T.DreamEngine(core, () => T.defaultMemorySettings(), null);
+    await engine.runNow({ reason: 'test' });
+
+    const after = await core.status(true);
+    assert.equal(after.stores[0].pendingInbox, 0, 'consumed by Dream → 0 pending (file lines stay on disk)');
+    // one more capture → pending goes back up
+    await store.pushInbox({ ts: new Date().toISOString(), content: '再来一条。', source: { session: 's', turn: null }, via: 'auto-heuristic' });
+    const again = await core.status(true);
+    assert.equal(again.stores[0].pendingInbox, 1);
+  });
+});
+
+// ── F7: putCard/patchCard can defer the index rebuild ──────────────────────
+
+test('F7: putCard {rebuild:false} does not rewrite index.json; explicit rebuild picks it up', async () => {
+  await withDshHome(async () => {
+    const T = await import('../lib/testing.js');
+    const core = await T.MemoryCore.create({ logger: null });
+    const store = core.global;
+    await core.remember({ content: '初始卡片。', scope: 'global' }, 'tool', 's1');
+    const mtimeBefore = (await stat(store.paths.index)).mtimeMs;
+
+    const card = {
+      id: T.makeCardId(new Date()),
+      kind: 'fact',
+      tags: [],
+      importance: 5,
+      confidence: 0.5,
+      created: new Date().toISOString(),
+      updated: new Date().toISOString(),
+      lastAccessed: new Date().toISOString(),
+      accessCount: 0,
+      validSince: new Date().toISOString(),
+      validUntil: null,
+      supersedes: [],
+      source: { session: 's', turn: null },
+      links: [],
+      title: '延迟重建的卡片。',
+      body: '',
+    };
+    await store.putCard(card, { rebuild: false });
+    await waitMs(15);
+    assert.equal((await stat(store.paths.index)).mtimeMs, mtimeBefore, 'no index rewrite without rebuild');
+    // the card file exists even though the index is stale
+    assert.ok(await core.global.readCard(card.id), 'card is readable');
+
+    const index = await store.rebuildIndex();
+    assert.ok(index.cards[card.id], 'explicit rebuild picks the deferred card up');
   });
 });
