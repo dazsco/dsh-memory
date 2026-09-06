@@ -1,0 +1,8 @@
+# Consistent line endings: the plugin is developed on Windows and consumed on
+# Linux/macOS (DSH home dirs). Text files stay LF in the worktree so the
+# JSONL appenders and the CRLF-vs-LF split are never an issue.
+* text=auto eol=lf
+
+# Binary artifacts (if any ever land here) must not be "normalized".
+*.png binary
+*.ico binary
