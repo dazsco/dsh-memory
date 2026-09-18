@@ -77,10 +77,73 @@ export function cardStrength(accessCount: number, updated: string, now: Date): n
   return Math.min(1, 0.5 + 0.1 * accessCount) * Math.pow(0.999, days);
 }
 
-/** Composite score for one candidate (rel normalized to 0..1 by the caller). */
-export function compositeScore(rel: number, importance: number, recency: number, strength: number): number {
-  return (0.5 * rel + 0.2 * (importance / 10) + 0.3 * recency) * strength;
+/**
+ * Composite score for one candidate (rel normalized to 0..1 by the caller).
+ *
+ * Shape: relevance dominates, then recency, then importance, then the
+ * corroboration confidence the store has accumulated for the card. The whole
+ * product is scaled by access strength (Ebbinghaus-style decay).
+ */
+export function compositeScore(
+  rel: number,
+  importance: number,
+  recency: number,
+  strength: number,
+  confidence = 0.6,
+): number {
+  const conf = Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : 0.6;
+  return (0.45 * rel + 0.15 * (importance / 10) + 0.3 * recency + 0.1 * conf) * strength;
 }
+
+/** Structured recall filter applied to card metadata before scoring. */
+export interface RecallFilter {
+  /** Restrict to these memory kinds (empty/absent = all). */
+  kinds?: ReadonlySet<string>;
+  /** Require at least one of these tags (empty/absent = no tag constraint). */
+  tags?: ReadonlySet<string>;
+  /** Restrict to these store slugs (empty/absent = the caller's store set). */
+  stores?: ReadonlySet<string>;
+  /** Only cards updated at/after this ISO timestamp. */
+  since?: string;
+  /**
+   * Include cards that were superseded (`validUntil !== null`). Default false:
+   * a superseded card is history, not guidance.
+   */
+  includeSuperseded?: boolean;
+  /** Minimum importance (1..10). */
+  minImportance?: number;
+}
+
+/** One card's metadata as seen by {@link passesFilter}. */
+export interface FilterableMeta {
+  kind: string;
+  tags: readonly string[];
+  updated: string;
+  validUntil: string | null;
+  importance: number;
+}
+
+/** True when the card satisfies every active constraint of `filter`. */
+export function passesFilter(meta: FilterableMeta, filter: RecallFilter | undefined): boolean {
+  // Supersession is a read-path invariant, not an optional filter: a card with
+  // validUntil set is history and is never served unless explicitly asked for.
+  if (filter?.includeSuperseded !== true && meta.validUntil !== null) return false;
+  if (filter === undefined) return true;
+  if (filter.kinds !== undefined && filter.kinds.size > 0 && !filter.kinds.has(meta.kind)) return false;
+  if (filter.minImportance !== undefined && meta.importance < filter.minImportance) return false;
+  if (filter.since !== undefined && filter.since !== '') {
+    // ISO-8601 UTC strings compare lexicographically; Date.parse guards junk.
+    const since = Date.parse(filter.since);
+    if (Number.isFinite(since) && Date.parse(meta.updated) < since) return false;
+  }
+  if (filter.tags !== undefined && filter.tags.size > 0) {
+    const wanted = [...filter.tags].map((t) => t.trim().toLowerCase());
+    const have = meta.tags.map((t) => t.toLowerCase());
+    if (!wanted.some((t) => have.includes(t))) return false;
+  }
+  return true;
+}
+
 
 export interface ScoredCandidate {
   id: string;
@@ -118,6 +181,61 @@ export function rankWithMmr(candidates: ScoredCandidate[], mmrLambda = 0.3): Sco
     pools.delete(best.id);
   }
   return selected;
+}
+
+/**
+ * One-hop graph expansion (A-MEM style). Every already-selected hit promotes
+ * its `links` neighbours to `max(own score, parent score × decay)`, so a card
+ * the lexical query missed but the graph connects to a strong hit can still
+ * surface — without ever demoting an independently stronger candidate.
+ *
+ * @param ranked - the MMR-ranked selection.
+ * @param pool - every filtered candidate (may include zero-lexical-score cards,
+ *   which is exactly what link expansion is for).
+ * @param limit - hard cap on the returned length.
+ * @param opts - `decay` (default 0.5) and `hops` (default 1).
+ * @returns a new array, re-sorted by score, containing at most `limit` items.
+ */
+export function expandLinks(
+  ranked: readonly ScoredCandidate[],
+  pool: ReadonlyMap<string, ScoredCandidate>,
+  limit: number,
+  opts: { decay?: number; hops?: number } = {},
+): ScoredCandidate[] {
+  const decay = opts.decay ?? 0.5;
+  const hops = Math.max(0, opts.hops ?? 1);
+  const byId = new Map<string, ScoredCandidate>(ranked.map((c) => [c.id, c]));
+  const order: string[] = ranked.map((c) => c.id);
+  let frontier: ScoredCandidate[] = [...ranked];
+  for (let hop = 0; hop < hops; hop++) {
+    const next: ScoredCandidate[] = [];
+    for (const parent of frontier) {
+      for (const id of parent.meta.links ?? []) {
+        if (id === parent.id) continue;
+        const neighbour = pool.get(id);
+        if (neighbour === undefined) continue;
+        const promoted = parent.score * decay;
+        const existing = byId.get(id);
+        if (existing !== undefined) {
+          if (promoted > existing.score) {
+            existing.score = promoted;
+          }
+          continue;
+        }
+        const admitted: ScoredCandidate = { ...neighbour, score: Math.max(neighbour.score, promoted) };
+        byId.set(id, admitted);
+        order.push(id);
+        next.push(admitted);
+      }
+    }
+    if (next.length === 0) break;
+    frontier = next;
+  }
+  return order
+    .map((id) => byId.get(id))
+    .filter((c): c is ScoredCandidate => c !== undefined)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(0, limit));
 }
 
 /**

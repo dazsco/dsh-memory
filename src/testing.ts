@@ -4,7 +4,23 @@
  * the host loader only ever imports lib/index.js (`apply`).
  */
 export { MEMORY_SCHEMA_VERSION, MEMORY_KINDS, MemoryPolicyError, MemoryFsError } from './types.ts';
-export type { MemoryCard, CardMeta, MemoryIndex, InboxEntry, AuditEntry, DreamState, RecallHit, StatusReport } from './types.ts';
+export type {
+  MemoryCard,
+  CardMeta,
+  MemoryIndex,
+  InboxEntry,
+  AuditEntry,
+  AuditOp,
+  AuditVia,
+  DreamState,
+  RecallHit,
+  StatusReport,
+  StoreStatus,
+  MemoryExportBundle,
+  MemoryExportStore,
+  MemoryImportResult,
+  MemoryImportStoreResult,
+} from './types.ts';
 
 export { readTextSafe, readJsonSafe, writeJsonAtomic, appendJsonl, readJsonlLines, readJsonlLinesLenient, listFiles, mtimeMsSafe, ensureDir } from './fsutil.ts';
 
@@ -16,8 +32,8 @@ export type { SecretScan, PiiMode, PiiResult } from './redact.ts';
 export { parseMemorySection, mergeRules, emptyRules } from './rules.ts';
 export type { MemoryRules } from './rules.ts';
 
-export { tokenize, jaccard, bm25Score, cardRecency, cardStrength, compositeScore, rankWithMmr, makeSnippet } from './retrieval.ts';
-export type { ScoredCandidate } from './retrieval.ts';
+export { tokenize, jaccard, bm25Score, cardRecency, cardStrength, compositeScore, rankWithMmr, makeSnippet, expandLinks, passesFilter } from './retrieval.ts';
+export type { ScoredCandidate, RecallFilter, FilterableMeta } from './retrieval.ts';
 
 export { dedupDecide, normalizeMemoryText, DEDUP_THRESHOLDS } from './dedup.ts';
 export type { DedupDecision, DedupAction } from './dedup.ts';
@@ -46,7 +62,7 @@ export type { StoreLogger } from './store.ts';
 export { healOrphanLock, isLockTimeout } from './lockheal.ts';
 
 export { MemoryCore, normalizeTags } from './core.ts';
-export type { RememberInput, RecallOptions, ForgetResult } from './core.ts';
+export type { RememberInput, RecallOptions, ForgetOptions, ForgetResult, CardRef } from './core.ts';
 
 export { MemorySettingsSchema, defaultMemorySettings, MEMORY_NS } from './settings.ts';
 export type { MemorySettings } from './settings.ts';
@@ -54,11 +70,14 @@ export type { MemorySettings } from './settings.ts';
 export { buildBrief } from './brief.ts';
 export type { BriefOptions } from './brief.ts';
 
-export { DreamEngine, registerDream } from './dream.ts';
-export type { DreamLlm, DreamRunOptions, StoreDreamResult, DreamRunResult } from './dream.ts';
+export { DreamEngine, registerDream, attachDreamTimers } from './dream.ts';
+export type { DreamLlm, DreamRunOptions, StoreDreamResult, DreamRunResult, DreamTimers } from './dream.ts';
 
-export { registerCapture, extractIntentSentences, splitSentences, stripSystemReminders } from './capture.ts';
+export { registerCapture, extractIntentSentences, splitSentences, stripSystemReminders, extractSummaryText } from './capture.ts';
 export type { SessionLike, IntentCandidate } from './capture.ts';
+
+export { registerMemoryCommands } from './commands.ts';
+export type { CommandsService, CommandsCtx, CommandInvocation } from './commands.ts';
 
 export {
   callMemoryLlm,
@@ -77,7 +96,7 @@ export type { MemoryLlmDeps, MemoryLlmService, MemoryLlmRequest, LlmResult, LlmF
 
 export { registerMemoryTools } from './tools.ts';
 
-export { makeBrowseHandlers, registerBrowseRoutes, MEMORY_BROWSE_PATHS } from './browse.ts';
+export { makeBrowseHandlers, registerBrowseRoutes, MEMORY_BROWSE_PATHS, MEMORY_BROWSE_ROUTES } from './browse.ts';
 export type {
   MemoryBrowseDeps,
   BrowseConnection,
@@ -91,6 +110,9 @@ export type {
   BrowseArchivedCard,
   BrowseArchiveList,
   BrowseCardActionResult,
+  BrowseAuditEntry,
+  BrowseAuditList,
+  BrowseDreamResult,
 } from './browse.ts';
 
 export { apply } from './index.ts';

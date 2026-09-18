@@ -15,14 +15,33 @@ export const MemorySettingsSchema = z.object({
     .object({
       /** off: never capture; explicit: only memory_remember; auto: + turn-end extraction. */
       mode: z.union([z.const('off'), z.const('explicit'), z.const('auto')]).default('auto'),
-      /** Use the user-configured LLM route for extraction (round 2). Until then heuristic only. */
+      /** Use the user-configured LLM route for extraction. */
       useLlm: z.boolean().default(true),
       /** Tail of the turn text offered to extraction. */
       turnTailChars: z.natural().max(200000).default(20000),
       /** Turns shorter than this are never captured. */
       minTurnContentChars: z.natural().default(120),
+      /**
+       * Stage the harness's OWN compaction summary into project memory as a
+       * `summary`-kind candidate. A compacted session's durable outcome then
+       * survives the compaction instead of being reduced to a checkpoint the
+       * next Dream never sees.
+       */
+      compaction: z.boolean().default(true),
+      /** Byte cap for one compaction summary candidate. */
+      compactionMaxChars: z.natural().min(200).max(20000).default(4000),
+      /** Score the intent heuristic on user statements (cheap, high precision). */
+      heuristic: z.boolean().default(true),
     })
-    .default({ mode: 'auto', useLlm: true, turnTailChars: 20000, minTurnContentChars: 120 }),
+    .default({
+      mode: 'auto',
+      useLlm: true,
+      turnTailChars: 20000,
+      minTurnContentChars: 120,
+      compaction: true,
+      compactionMaxChars: 4000,
+      heuristic: true,
+    }),
   /** PII policy (the built-in secret gate is always on and cannot be configured). */
   redact: z.object({
     /** off | warn (audit only) | redact (mask in stored text). */
@@ -54,6 +73,28 @@ export const MemorySettingsSchema = z.object({
       globalK: z.natural().max(50).default(8),
     })
     .default({ enabled: true, maxBytes: 4096, projectK: 12, globalK: 8 }),
+  /** Recall / ranking policy. */
+  recall: z
+    .object({
+      /** Default max hits for one recall (1–50). */
+      k: z.natural().min(1).max(50).default(8),
+      /** Promote 1-hop link-graph neighbours of the top hits (A-MEM). */
+      expandLinks: z.boolean().default(true),
+      /** Link-promotion factor for an admitted neighbour (0–1). */
+      linkDecay: z.number().min(0).max(1).default(0.5),
+      /**
+       * Include cards the agent already superseded in the session brief.
+       * Off (default): the brief shows the live version only.
+       */
+      briefIncludeSuperseded: z.boolean().default(false),
+    })
+    .default({ k: 8, expandLinks: true, linkDecay: 0.5, briefIncludeSuperseded: false }),
+  /** Human-facing slash-command surface (`/memory ...` in the composer). */
+  commands: z
+    .object({
+      enabled: z.boolean().default(true),
+    })
+    .default({ enabled: true }),
   /** Write-path budgets. */
   budget: z
     .object({
@@ -92,10 +133,20 @@ export type MemorySettings = Schemastery.TypeT<typeof MemorySettingsSchema>;
 export function defaultMemorySettings(): MemorySettings {
   return {
     enabled: true,
-    capture: { mode: 'auto', useLlm: true, turnTailChars: 20000, minTurnContentChars: 120 },
+    capture: {
+      mode: 'auto',
+      useLlm: true,
+      turnTailChars: 20000,
+      minTurnContentChars: 120,
+      compaction: true,
+      compactionMaxChars: 4000,
+      heuristic: true,
+    },
     redact: { pii: 'redact' },
     dream: { enabled: true, useLlm: true, intervalMinutes: 30, maxLlmCalls: 40, maxWallMs: 600000, requestSeq: 0 },
     brief: { enabled: true, maxBytes: 4096, projectK: 12, globalK: 8 },
+    recall: { k: 8, expandLinks: true, linkDecay: 0.5, briefIncludeSuperseded: false },
+    commands: { enabled: true },
     budget: { maxCardBytes: 4096, maxInboxLines: 1000 },
     llm: { provider: '', model: '', maxOutputTokens: 2000, timeoutMs: 60000 },
   };

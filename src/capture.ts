@@ -123,6 +123,29 @@ export function extractIntentSentences(text: string, max = MAX_CANDIDATES): Inte
   return out;
 }
 
+/**
+ * Flatten harness compaction summary blocks into plain text. Accepts the
+ * `ContentBlock[]` payload of `compaction/summary`; non-text blocks are
+ * dropped, and a plain string is accepted for resilience against a shape
+ * change. No throw: a malformed payload yields ''.
+ */
+export function extractSummaryText(summary: unknown): string {
+  if (typeof summary === 'string') return summary.trim();
+  if (!Array.isArray(summary)) return '';
+  const parts: string[] = [];
+  for (const block of summary) {
+    if (typeof block === 'string') {
+      parts.push(block);
+      continue;
+    }
+    if (block !== null && typeof block === 'object') {
+      const text = (block as { text?: unknown }).text;
+      if (typeof text === 'string') parts.push(text);
+    }
+  }
+  return parts.join('\n').trim();
+}
+
 interface CtxLike {
   on: (event: string, listener: (...args: unknown[]) => void) => void;
   /** Fiber-aware timer (dsh-timers); when absent, extraction runs immediately. */
@@ -132,6 +155,12 @@ interface CtxLike {
 /**
  * Register the capture listener. Structural types keep this testable with a
  * fake ctx; every callback is failure-contained (never throws into the bus).
+ *
+ * Two session signals feed the inbox:
+ *   - `turn/end` — the tail of the turn is scanned (heuristic + optional LLM);
+ *   - `compaction/summary` — the HARNESS's own compaction summary is staged as
+ *     one `summary` candidate, so a session's durable outcome survives the
+ *     compaction that replaced its history.
  */
 export function registerCapture(
   ctx: CtxLike,
@@ -141,21 +170,86 @@ export function registerCapture(
   llmDeps: MemoryLlmDeps | null = null,
 ): void {
   const pending = new Map<string, () => void>();
+  /** Summary digests already staged per session (compaction may repeat). */
+  const stagedSummaries = new Map<string, Set<string>>();
 
   ctx.on('session/event', (...args: unknown[]) => {
     const session = args[0] as SessionLike | undefined;
-    const event = args[1] as { type?: string; turn?: number } | undefined;
+    const event = args[1] as { type?: string; turn?: number; data?: { summary?: unknown } } | undefined;
     try {
-      if (!event || event.type !== 'turn/end') return;
-      if (!session || typeof session.id !== 'string') return;
-      const s = getSettings();
-      if (!s.enabled || s.capture.mode === 'off') return;
-      if ((session.header?.delegationDepth ?? 0) > 0) return;
-      scheduleExtraction(session);
+      if (!event || !session || typeof session.id !== 'string') return;
+      if (event.type === 'turn/end') {
+        const s = getSettings();
+        if (!s.enabled || s.capture.mode !== 'auto') return;
+        if ((session.header?.delegationDepth ?? 0) > 0) return;
+        scheduleExtraction(session);
+        return;
+      }
+      if (event.type === 'compaction/summary') {
+        const s = getSettings();
+        if (!s.enabled || s.capture.mode !== 'auto' || !s.capture.compaction) return;
+        if ((session.header?.delegationDepth ?? 0) > 0) return;
+        scheduleCompactionCapture(session, event);
+      }
     } catch (err) {
       logger?.warn(`[dsh-memory] capture event failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
+
+  /**
+   * Stage the compaction summary once per distinct summary text. The harness
+   * emits one `compaction/summary` per compaction; a session compacted
+   * repeatedly can re-summarize the same span, so identical digests are
+   * dropped instead of piling duplicates into the inbox.
+   */
+  function scheduleCompactionCapture(sess: SessionLike, event: { data?: { summary?: unknown } }): void {
+    void (async () => {
+      try {
+        const s = getSettings();
+        const text = extractSummaryText(event.data?.summary).slice(0, s.capture.compactionMaxChars);
+        if (text.length < 40) return;
+        const digest = text.slice(0, 400);
+        let seen = stagedSummaries.get(sess.id);
+        if (seen === undefined) {
+          seen = new Set<string>();
+          stagedSummaries.set(sess.id, seen);
+        }
+        if (seen.has(digest)) return;
+        seen.add(digest);
+        if (seen.size > 50) seen.clear(); // bound the per-session set
+
+        const cwd = sess.header?.cwd;
+        const project = cwd ? await core.projectStoreForCwd(cwd).catch(() => null) : null;
+        const store = project ?? core.global;
+        const rules = await core.rulesFor(store.slug).catch(() => emptyRules());
+        const gated = gateCandidate(text, rules.denyKeywords, s.redact.pii);
+        if (!gated.ok) {
+          await store
+            .audit({
+              ts: new Date().toISOString(),
+              store: store.slug,
+              op: 'block',
+              detail: `compaction-summary:${gated.reasons.join(',')}`,
+              via: 'auto-compaction',
+              session: sess.id,
+            })
+            .catch(() => undefined);
+          return;
+        }
+        await store.pushInbox({
+          ts: new Date().toISOString(),
+          content: gated.text,
+          kind: 'summary',
+          tags: ['compaction'],
+          importance: 6,
+          via: 'auto-compaction',
+          source: { session: sess.id, turn: null },
+        });
+      } catch (err) {
+        logger?.warn(`[dsh-memory] compaction capture failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    })();
+  }
 
   function scheduleExtraction(sess: SessionLike): void {
     const run = () => {
@@ -175,7 +269,7 @@ export function registerCapture(
 
   async function extractFor(sess: SessionLike): Promise<void> {
     const s = getSettings();
-    if (!s.enabled || s.capture.mode === 'off') return;
+    if (!s.enabled || s.capture.mode !== 'auto') return;
     const messages = sess.deriveMessages?.() ?? [];
     let tail = '';
     let userTail = '';
@@ -206,7 +300,9 @@ export function registerCapture(
     // quotes or discusses intent words (e.g. this plugin's own debugging)
     // must never stage a verbatim card. The LLM pass still sees the full
     // tail and is scope-disciplined by the system prompt.
-    const candidates = extractIntentSentences(userTail.slice(0, s.capture.turnTailChars));
+    const candidates = s.capture.heuristic
+      ? extractIntentSentences(userTail.slice(0, s.capture.turnTailChars))
+      : [];
     const cwd = sess.header?.cwd;
     const project = cwd ? await core.projectStoreForCwd(cwd).catch(() => null) : null;
     const targetStore = project ?? core.global;

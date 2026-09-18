@@ -212,7 +212,7 @@ test('browse: inbox lists pending captures with count and truncation', async () 
   });
 });
 
-test('browse: registerBrowseRoutes mounts 7 exact routes (5 GET + 2 POST) on the fiber and disposes them', async () => {
+test('browse: registerBrowseRoutes mounts 13 exact routes (7 GET + 6 POST) on the fiber and disposes them', async () => {
   await withDshHome(async () => {
     const T = await import('../lib/testing.js');
     const core = await T.MemoryCore.create({ logger: null });
@@ -240,22 +240,14 @@ test('browse: registerBrowseRoutes mounts 7 exact routes (5 GET + 2 POST) on the
     };
 
     T.registerBrowseRoutes(ctx, { core, isEnabled: () => true, logger: quietLogger });
-    assert.equal(registered.length, 7);
+    assert.equal(registered.length, 13);
     assert.deepEqual(
       registered.map((r) => r.path),
-      [
-        T.MEMORY_BROWSE_PATHS.summary,
-        T.MEMORY_BROWSE_PATHS.cards,
-        T.MEMORY_BROWSE_PATHS.card,
-        T.MEMORY_BROWSE_PATHS.inbox,
-        T.MEMORY_BROWSE_PATHS.archive,
-        T.MEMORY_BROWSE_PATHS.forget,
-        T.MEMORY_BROWSE_PATHS.restore,
-      ],
+      T.MEMORY_BROWSE_ROUTES.map((r) => r.path),
     );
     assert.ok(registered.every((r) => r.requestBody === 'buffered'));
-    assert.equal(registered.filter((r) => r.methods.join(',') === 'GET').length, 5);
-    assert.equal(registered.filter((r) => r.methods.join(',') === 'POST').length, 2);
+    assert.equal(registered.filter((r) => r.methods.join(',') === 'GET').length, 7);
+    assert.equal(registered.filter((r) => r.methods.join(',') === 'POST').length, 6);
 
     // the mounted handler serves the live core
     const res = await registered[0].fetch(new Request('http://host/api/memory/summary'));

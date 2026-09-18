@@ -1,7 +1,7 @@
 /**
  * The dsh-memory settings card: edits the `memory` namespace (a nested
- * section — capture/dream/brief/llm/redact) from the plugin-configuration
- * section (the `settings.plugin.item` seat).
+ * section — capture/dream/brief/llm/redact) as the `memory` tab of the
+ * Plugins settings section (`settings.plugins.tab`).
  *
  * Self-contained card chrome (disclosure header, staged fields grouped by
  * section, save/discard footer) following the plugin-card store pattern of
@@ -20,6 +20,7 @@ import {
   booleanField,
   CardForm,
   numberField,
+  ratioField,
   selectField,
   textField,
   type CardActions,
@@ -39,6 +40,9 @@ export interface MemorySettingsCardState extends CardShell {
   captureUseLlm: CardFieldState;
   turnTailChars: CardFieldState;
   minTurnContentChars: CardFieldState;
+  captureCompaction: CardFieldState;
+  captureCompactionMaxChars: CardFieldState;
+  captureHeuristic: CardFieldState;
   dreamEnabled: CardFieldState;
   dreamUseLlm: CardFieldState;
   dreamInterval: CardFieldState;
@@ -48,6 +52,11 @@ export interface MemorySettingsCardState extends CardShell {
   briefMaxBytes: CardFieldState;
   briefProjectK: CardFieldState;
   briefGlobalK: CardFieldState;
+  recallK: CardFieldState;
+  recallExpandLinks: CardFieldState;
+  recallLinkDecay: CardFieldState;
+  recallBriefIncludeSuperseded: CardFieldState;
+  commandsEnabled: CardFieldState;
   llmProvider: CardFieldState;
   llmModel: CardFieldState;
   llmMaxOutputTokens: CardFieldState;
@@ -82,6 +91,9 @@ export class MemorySettingsCardController {
       booleanField(['capture', 'useLlm']),
       numberField(['capture', 'turnTailChars'], 1),
       numberField(['capture', 'minTurnContentChars'], 0),
+      booleanField(['capture', 'compaction']),
+      numberField(['capture', 'compactionMaxChars'], 200),
+      booleanField(['capture', 'heuristic']),
       booleanField(['dream', 'enabled']),
       booleanField(['dream', 'useLlm']),
       numberField(['dream', 'intervalMinutes'], 5),
@@ -91,6 +103,11 @@ export class MemorySettingsCardController {
       numberField(['brief', 'maxBytes'], 512),
       numberField(['brief', 'projectK'], 0),
       numberField(['brief', 'globalK'], 0),
+      numberField(['recall', 'k'], 1),
+      booleanField(['recall', 'expandLinks']),
+      ratioField(['recall', 'linkDecay'], 0, 1),
+      booleanField(['recall', 'briefIncludeSuperseded']),
+      booleanField(['commands', 'enabled']),
       textField(['llm', 'provider']),
       textField(['llm', 'model']),
       numberField(['llm', 'maxOutputTokens'], 16),
@@ -109,6 +126,9 @@ export class MemorySettingsCardController {
       captureUseLlm: this.form.field('capture.useLlm'),
       turnTailChars: this.form.field('capture.turnTailChars'),
       minTurnContentChars: this.form.field('capture.minTurnContentChars'),
+      captureCompaction: this.form.field('capture.compaction'),
+      captureCompactionMaxChars: this.form.field('capture.compactionMaxChars'),
+      captureHeuristic: this.form.field('capture.heuristic'),
       dreamEnabled: this.form.field('dream.enabled'),
       dreamUseLlm: this.form.field('dream.useLlm'),
       dreamInterval: this.form.field('dream.intervalMinutes'),
@@ -118,6 +138,11 @@ export class MemorySettingsCardController {
       briefMaxBytes: this.form.field('brief.maxBytes'),
       briefProjectK: this.form.field('brief.projectK'),
       briefGlobalK: this.form.field('brief.globalK'),
+      recallK: this.form.field('recall.k'),
+      recallExpandLinks: this.form.field('recall.expandLinks'),
+      recallLinkDecay: this.form.field('recall.linkDecay'),
+      recallBriefIncludeSuperseded: this.form.field('recall.briefIncludeSuperseded'),
+      commandsEnabled: this.form.field('commands.enabled'),
       llmProvider: this.form.field('llm.provider'),
       llmModel: this.form.field('llm.model'),
       llmMaxOutputTokens: this.form.field('llm.maxOutputTokens'),
@@ -145,9 +170,9 @@ export class MemorySettingsCardController {
   }
 }
 
-/** Props the renderer binds for the dsh-memory plugin-configuration card. */
+/** Props the renderer binds for the dsh-memory Plugins-section tab. */
 export type MemorySettingsCardProps =
-  PropsRuntime<'settings.plugin.item'> & PropsLocale<'dsh-memory'> & InjectFace<MemorySettingsCardFace>;
+  PropsRuntime<'settings.plugins.tab'> & PropsLocale<'dsh-memory'> & InjectFace<MemorySettingsCardFace>;
 
 /** Card chrome: a disclosure header naming the plugin and what its settings govern, the controls, and the save that writes them. */
 function SettingsCard(props: {
@@ -165,7 +190,7 @@ function SettingsCard(props: {
   const title = props.t(props.titleKey);
   const blocked = !state.dirty || state.invalid || state.saving;
   return (
-    <li className={open ? 'dshMemCard dshMemCardOpen' : 'dshMemCard'}>
+    <section className={open ? 'dshMemCard dshMemCardOpen' : 'dshMemCard'}>
       <button
         type="button"
         className="dshMemHeader"
@@ -209,7 +234,7 @@ function SettingsCard(props: {
           </div>
         </div>
       ) : null}
-    </li>
+    </section>
   );
 }
 
@@ -227,8 +252,8 @@ interface FieldProps {
   onReset: () => void;
 }
 
-/** A staged value field; `numeric` only hints the keypad, which drafts a field accepts is decided by its spec. */
-function ValueField(props: FieldProps & { numeric?: boolean; placeholder?: string }) {
+/** A staged value field; `numeric`/`decimal` only hint the keypad, which drafts a field accepts is decided by its spec. */
+function ValueField(props: FieldProps & { numeric?: boolean; decimal?: boolean; placeholder?: string }) {
   return (
     <div className="dshMemField">
       <div className="dshMemHead">
@@ -246,7 +271,7 @@ function ValueField(props: FieldProps & { numeric?: boolean; placeholder?: strin
         id={props.id}
         className={props.invalid ? 'dshMemInput dshMemInputInvalid' : 'dshMemInput'}
         type="text"
-        inputMode={props.numeric === true ? 'numeric' : undefined}
+        inputMode={props.decimal === true ? 'decimal' : props.numeric === true ? 'numeric' : undefined}
         aria-invalid={props.invalid || undefined}
         value={props.text}
         placeholder={props.placeholder ?? ''}
@@ -417,6 +442,34 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
           onEdit={(text) => props.edit('capture.minTurnContentChars', text)}
           onReset={() => props.resetField('capture.minTurnContentChars')}
         />
+        <BooleanField
+          id="memory-capture-compaction"
+          label={t('field.captureCompaction')}
+          hint={t('field.captureCompactionHint')}
+          {...shared}
+          {...state.captureCompaction}
+          onEdit={(text) => props.edit('capture.compaction', text)}
+          onReset={() => props.resetField('capture.compaction')}
+        />
+        <ValueField
+          id="memory-capture-compaction-max-chars"
+          label={t('field.captureCompactionMaxChars')}
+          hint={t('field.captureCompactionMaxCharsHint')}
+          numeric
+          {...shared}
+          {...state.captureCompactionMaxChars}
+          onEdit={(text) => props.edit('capture.compactionMaxChars', text)}
+          onReset={() => props.resetField('capture.compactionMaxChars')}
+        />
+        <BooleanField
+          id="memory-capture-heuristic"
+          label={t('field.captureHeuristic')}
+          hint={t('field.captureHeuristicHint')}
+          {...shared}
+          {...state.captureHeuristic}
+          onEdit={(text) => props.edit('capture.heuristic', text)}
+          onReset={() => props.resetField('capture.heuristic')}
+        />
       </Group>
       <Group t={t} titleKey="group.dream">
         <BooleanField
@@ -527,6 +580,57 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
           {...state.briefGlobalK}
           onEdit={(text) => props.edit('brief.globalK', text)}
           onReset={() => props.resetField('brief.globalK')}
+        />
+      </Group>
+      <Group t={t} titleKey="group.recall">
+        <ValueField
+          id="memory-recall-k"
+          label={t('field.recallK')}
+          hint={t('field.recallKHint')}
+          numeric
+          {...shared}
+          {...state.recallK}
+          onEdit={(text) => props.edit('recall.k', text)}
+          onReset={() => props.resetField('recall.k')}
+        />
+        <BooleanField
+          id="memory-recall-expand-links"
+          label={t('field.recallExpandLinks')}
+          hint={t('field.recallExpandLinksHint')}
+          {...shared}
+          {...state.recallExpandLinks}
+          onEdit={(text) => props.edit('recall.expandLinks', text)}
+          onReset={() => props.resetField('recall.expandLinks')}
+        />
+        <ValueField
+          id="memory-recall-link-decay"
+          label={t('field.recallLinkDecay')}
+          hint={t('field.recallLinkDecayHint')}
+          decimal
+          {...shared}
+          {...state.recallLinkDecay}
+          onEdit={(text) => props.edit('recall.linkDecay', text)}
+          onReset={() => props.resetField('recall.linkDecay')}
+        />
+        <BooleanField
+          id="memory-recall-brief-include-superseded"
+          label={t('field.recallBriefIncludeSuperseded')}
+          hint={t('field.recallBriefIncludeSupersededHint')}
+          {...shared}
+          {...state.recallBriefIncludeSuperseded}
+          onEdit={(text) => props.edit('recall.briefIncludeSuperseded', text)}
+          onReset={() => props.resetField('recall.briefIncludeSuperseded')}
+        />
+      </Group>
+      <Group t={t} titleKey="group.commands">
+        <BooleanField
+          id="memory-commands-enabled"
+          label={t('field.commandsEnabled')}
+          hint={t('field.commandsEnabledHint')}
+          {...shared}
+          {...state.commandsEnabled}
+          onEdit={(text) => props.edit('commands.enabled', text)}
+          onReset={() => props.resetField('commands.enabled')}
         />
       </Group>
       <Group t={t} titleKey="group.llm">

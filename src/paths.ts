@@ -14,7 +14,7 @@ import { promises as fs } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
 import { withFileLock } from '@deepseek-ai/dsh-atomic-write';
-import { ensureDir, readJsonSafe, writeJsonAtomic } from './fsutil.ts';
+import { ensureDir, mtimeMsSafe, readJsonSafe, writeJsonAtomic } from './fsutil.ts';
 import { healOrphanLock, isLockTimeout } from './lockheal.ts';
 import { MemorySchema } from './schema.ts';
 
@@ -83,14 +83,36 @@ export interface ProjectsRegistry {
   projects: Record<string, ProjectEntry>;
 }
 
+/**
+ * In-process registry cache. `projects.json` is read on every status row and
+ * every rules lookup; the file only ever changes through this module, so the
+ * cached copy is authoritative and `saveProjectsRegistry` refreshes it. An
+ * mtime guard still catches an external edit (or another process).
+ */
+let registryCache: { mtime: number; reg: ProjectsRegistry } | null = null;
+
 export async function loadProjectsRegistry(): Promise<ProjectsRegistry> {
-  const reg = await readJsonSafe<ProjectsRegistry>(projectsRegistryPath());
-  if (reg && typeof reg === 'object' && reg.schema === MemorySchema && reg.projects) return reg;
-  return { schema: MemorySchema, projects: {} };
+  const file = projectsRegistryPath();
+  const mtime = (await mtimeMsSafe(file)) ?? -1;
+  if (registryCache !== null && registryCache.mtime === mtime) return registryCache.reg;
+  const reg = await readJsonSafe<ProjectsRegistry>(file);
+  const loaded: ProjectsRegistry =
+    reg && typeof reg === 'object' && reg.projects && typeof reg.projects === 'object'
+      ? { schema: MemorySchema, projects: reg.projects }
+      : { schema: MemorySchema, projects: {} };
+  registryCache = { mtime, reg: loaded };
+  return loaded;
 }
 
 export async function saveProjectsRegistry(reg: ProjectsRegistry): Promise<void> {
-  await writeJsonAtomic(projectsRegistryPath(), reg);
+  const file = projectsRegistryPath();
+  await writeJsonAtomic(file, reg);
+  registryCache = { mtime: (await mtimeMsSafe(file)) ?? -1, reg };
+}
+
+/** Drop the in-process registry cache (tests, external edits). */
+export function invalidateRegistryCache(): void {
+  registryCache = null;
 }
 
 /**

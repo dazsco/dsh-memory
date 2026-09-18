@@ -328,7 +328,7 @@ test('dream llm: summarize pass writes summary.md (budget 1 call)', async () => 
   });
 });
 
-test('dream llm: conflict pass archives the loser on keep decision', async () => {
+test('dream llm: conflict pass supersedes the loser on keep decision', async () => {
   await withDshHome(async (home) => {
     const { join } = await import('node:path');
     const core = await T.MemoryCore.create({ logger: null });
@@ -351,21 +351,34 @@ test('dream llm: conflict pass archives the loser on keep decision', async () =>
       async call(req) {
         fakeLlm.calls.n++;
         if (req.system === T.DREAM_SUMMARIZE_SYSTEM) return '概览文本。';
-        // keep cardA, archive cardB
+        // keep cardA, supersede cardB
         return `G1 ${cardA.id}`;
       },
     };
     const res = await engine.runNow({ reason: 'test', llm: fakeLlm });
     assert.equal(res.stores[0].error, undefined);
-    assert.equal(res.stores[0].archived, 1, 'conflict loser archived');
+    assert.equal(res.stores[0].superseded, 1, 'conflict loser superseded');
+    assert.equal(res.stores[0].archived, 0, 'supersede keeps the file (no archive move)');
     const { existsSync } = await import('node:fs');
     const { readFile } = await import('node:fs/promises');
-    const cardAfter = await core.global.readCard(cardB.id);
-    assert.equal(cardAfter, null, 'loser removed from live cards');
-    assert.ok(existsSync(join(home, 'memory', 'global', 'archive', `${cardB.id}.md`)), 'loser moved to archive/');
+    // Bitemporal: the loser stays on disk, gains validUntil + supersededBy,
+    // and drops out of the index/recall.
+    const loser = await core.global.readCard(cardB.id);
+    assert.ok(loser !== null, 'loser file kept as history');
+    assert.ok(loser.validUntil !== null, 'loser stamped with validUntil');
+    assert.equal(loser.supersededBy, cardA.id, 'loser back-links the winner');
+    const winner = await core.global.readCard(cardA.id);
+    assert.ok(winner.supersedes.includes(cardB.id), 'winner records the forward link');
+    assert.ok(!existsSync(join(home, 'memory', 'global', 'archive', `${cardB.id}.md`)), 'no archive move');
+    const index = await core.global.rebuildIndex();
+    assert.ok(index.cards[cardB.id], 'superseded card stays in the index as history');
+    assert.ok(index.cards[cardB.id].validUntil !== null, 'index row carries validUntil');
+    const recall = await core.recall('网关 生产端口 9000', { scope: 'global', k: 5 });
+    assert.ok(!recall.hits.some((h) => h.id === cardB.id), 'superseded card is not recalled');
     const audit = await readFile(join(home, 'memory', 'global', 'audit.jsonl'), 'utf8');
     assert.ok(audit.includes('"via":"dream-llm"'), 'audit records dream-llm via');
-    assert.ok(res.stores[0].notes.some((n) => n.startsWith('llm-conflict: archive ')));
+    assert.ok(audit.includes('"op":"supersede"'), 'audit records the supersede op');
+    assert.ok(res.stores[0].notes.some((n) => n.startsWith('llm-conflict: supersede ')));
   });
 });
 

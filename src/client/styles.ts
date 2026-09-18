@@ -9,7 +9,6 @@ const css = `
   border: 1px solid var(--dsw-alias-border-l2);
   background: var(--dsw-alias-bg-layer-3);
   border-radius: 12px;
-  list-style: none;
   transition: border-color .16s, background .16s;
 }
 .dshMemCard:hover { border-color: var(--dsw-alias-label-dimmed); }
@@ -292,6 +291,129 @@ const css = `
 .dshMemArchiveText { min-width: 0; flex: 1; flex-direction: column; gap: 2px; display: flex; }
 .dshMemArchiveTitle { min-width: 0; color: var(--dsw-alias-label-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
 .dshMemArchiveMeta { color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 1.5; }
+
+/* ── Memory page v3: stats, filters, editing, audit, export/import ─────── */
+.dshMemPageNote { color: var(--dsw-alias-label-secondary); margin: 0; font-size: 12px; line-height: 1.5; word-break: break-word; }
+.dshMemStats {
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  display: flex;
+}
+.dshMemStat {
+  flex-direction: column;
+  gap: 2px;
+  min-width: 84px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-3);
+  border-radius: 10px;
+  padding: 6px 12px;
+}
+.dshMemStatLabel { color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 1.5; }
+.dshMemStatValue { color: var(--dsw-alias-label-primary); margin: 0; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.3; }
+.dshMemPaneStats { flex-wrap: wrap; gap: 16px; display: flex; }
+.dshMemPaneStatBlock { flex-direction: column; gap: 4px; min-width: 0; display: flex; }
+.dshMemPaneStatTitle { color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 1.5; }
+.dshMemChipRow { align-items: center; flex-wrap: wrap; gap: 6px; display: flex; }
+.dshMemKindChip {
+  align-items: baseline;
+  gap: 6px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-secondary);
+  border-radius: 999px;
+  padding: 1px 10px;
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+  display: inline-flex;
+}
+.dshMemKindCount { color: var(--dsw-alias-label-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+.dshMemTagChip {
+  align-items: baseline;
+  gap: 6px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-secondary);
+  border-radius: 999px;
+  padding: 1px 10px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+  cursor: pointer;
+  display: inline-flex;
+}
+.dshMemTagChip:hover { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
+.dshMemTagChipActive { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); font-weight: 600; }
+.dshMemTagChip:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+.dshMemTagCount { color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }
+.dshMemFilters { align-items: center; flex-wrap: wrap; gap: 6px; display: flex; }
+.dshMemFilterLabel { color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; }
+.dshMemFilterCount { color: var(--dsw-alias-label-tertiary); margin-left: auto; font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.5; }
+.dshMemNew { flex-direction: column; gap: 8px; display: flex; }
+.dshMemDraft {
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-3);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.dshMemDraftRow { align-items: center; gap: 8px; display: flex; }
+.dshMemDraftLabel { flex: none; color: var(--dsw-alias-label-secondary); min-width: 96px; font-size: 12px; line-height: 1.5; }
+.dshMemDraftRow .dshMemInput, .dshMemDraftRow .dshMemSelect { flex: 1; min-width: 0; }
+.dshMemTextArea {
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-3);
+  font: inherit;
+  color: var(--dsw-alias-label-primary);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  min-height: 96px;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
+.dshMemTextArea:focus-visible { border-color: var(--dsw-alias-brand-primary); outline: none; }
+.dshMemTextArea:disabled { color: var(--dsw-alias-label-tertiary); cursor: default; }
+.dshMemEdit { flex-direction: column; gap: 8px; margin-bottom: 10px; display: flex; }
+.dshMemActionOk { color: var(--dsw-alias-brand-primary); width: 100%; margin: 0; font-size: 12px; line-height: 1.5; word-break: break-word; }
+.dshMemFileInput { display: none; }
+.dshMemAuditHead, .dshMemAuditRow {
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 12px;
+  display: flex;
+}
+.dshMemAuditHead {
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+.dshMemAuditList { list-style: none; margin: 0; padding: 0; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; overflow: hidden; }
+.dshMemAuditList > li + li { border-top: 1px solid var(--dsw-alias-border-l2); }
+.dshMemAuditRow { background: var(--dsw-alias-bg-layer-3); }
+.dshMemAuditRow:hover { background: var(--dsw-alias-bg-module-platform); }
+.dshMemAuditTime { flex: none; color: var(--dsw-alias-label-tertiary); width: 150px; font-size: 11px; font-variant-numeric: tabular-nums; }
+.dshMemAuditOp { flex: none; color: var(--dsw-alias-label-primary); width: 84px; font-size: 12px; font-weight: 500; }
+.dshMemAuditVia {
+  flex: none;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-bg-module-platform);
+  padding: 0 8px;
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.dshMemAuditId { flex: none; color: var(--dsw-alias-label-secondary); font-size: 11px; line-height: 1.5; }
+.dshMemAuditDetail { min-width: 0; flex: 1; color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; word-break: break-word; }
 `;
 
 /** Inject the stylesheet once; a no-op outside a browser environment. */

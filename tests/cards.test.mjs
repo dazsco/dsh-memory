@@ -24,6 +24,7 @@ function sampleCard() {
     validSince: now,
     validUntil: null,
     supersedes: [],
+    supersededBy: null,
     source: { session: 'sess-1', turn: 2 },
     links: [],
     title: '用 pnpm 管理依赖',

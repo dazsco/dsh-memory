@@ -7,8 +7,16 @@
  * (index.json, dream state) is always recomputable from the cards.
  */
 
-/** Current on-disk schema version of index.json / dream state. */
-export const MEMORY_SCHEMA_VERSION = 1;
+/**
+ * Current on-disk schema version of index.json / dream state.
+ *
+ * v2 — `CardMeta.terms` carries the card's token array so recall/Dream score
+ * from the derived index instead of re-reading every card file, and cards gain
+ * the explicit `supersededBy` back-link of the bitemporal pair. A v1 index is
+ * rebuilt on first read (the index is always recomputable); card files are
+ * forward/backward tolerant because every v2 field has a defined absence.
+ */
+export const MEMORY_SCHEMA_VERSION = 2;
 
 /** What kind of memory a card holds. */
 export type MemoryKind =
@@ -55,6 +63,12 @@ export interface MemoryCard {
   validUntil: string | null;
   /** Ids of cards this card supersedes. */
   supersedes: string[];
+  /**
+   * Id of the card that replaced this one (the inverse of `supersedes`).
+   * null = this card is the live version. Written together with `validUntil`
+   * by the supersede path; absent in v1 cards, which parse as null.
+   */
+  supersededBy: string | null;
   source: MemorySource;
   /** Related card ids (A-MEM style links). */
   links: string[];
@@ -78,11 +92,18 @@ export interface CardMeta {
   accessCount: number;
   validUntil: string | null;
   supersedes: string[];
+  supersededBy: string | null;
   links: string[];
   /** sha1 over normalized card content — change detection without re-reading. */
   digest: string;
-  /** Token count of title+body (rough, from the shared tokenizer). */
-  tokens: number;
+  /**
+   * The card's token array (title+body), persisted so recall/Dream/jaccard
+   * score straight from the index. Duplicates are preserved: BM25 needs term
+   * frequency, Jaccard wraps it in a Set.
+   */
+  terms: string[];
+  /** Serialized card size in bytes (drives status/stats without extra stats). */
+  bytes: number;
 }
 
 /** BM25 corpus statistics maintained by index rebuilds. */
@@ -129,9 +150,25 @@ export type AuditOp =
   | /** Auxiliary LLM path outcome for one turn capture (ok/skipped/error). */
   'llm'
   | /** A malformed (unparseable) inbox line skipped + advanced past by Dream. */
-  'quarantine';
+  'quarantine'
+  | /** A card replaced by a newer version (bitemporal supersede). */
+  'supersede'
+  | /** A card restored from an imported bundle (memory.export/import). */
+  'import';
 
-export type AuditVia = 'tool' | 'auto' | 'auto-heuristic' | 'auto-llm' | 'dream' | 'dream-llm' | 'user' | 'client' | 'system';
+export type AuditVia =
+  | 'tool'
+  | 'auto'
+  | 'auto-heuristic'
+  | 'auto-llm'
+  /** Harness compaction summary staged into the inbox. */
+  | 'auto-compaction'
+  | 'dream'
+  | 'dream-llm'
+  | 'user'
+  | 'client'
+  | 'command'
+  | 'system';
 
 export interface AuditEntry {
   ts: string;
@@ -192,18 +229,33 @@ export interface RecallHit {
   snippet: string;
   score: number;
   path: string;
+  tags: string[];
+  importance: number;
+  updated: string;
+  /** Id of the replacing card, null while the card is the live version. */
+  supersededBy: string | null;
+  /** 1-hop link ids (A-MEM graph), for graph-aware callers. */
+  links: string[];
 }
 
-/** Per-store counts reported by status. */
+/** Per-store counts and derived shape reported by status/stats. */
 export interface StoreStatus {
   slug: string;
   kind: 'global' | 'project';
   projectPath?: string;
   cards: number;
   archived: number;
+  /** Live cards whose `validUntil` is set (kept, no longer served). */
+  superseded: number;
   pendingInbox: number;
   lastDream: string | null;
   root: string;
+  /** Live-card histogram per kind (only non-zero kinds). */
+  kinds: Partial<Record<MemoryKind, number>>;
+  /** Most frequent tags over live cards, descending (top 10). */
+  topTags: { tag: string; count: number }[];
+  /** Bytes of the store's card files (live + archive). */
+  bytes: number;
 }
 
 export interface StatusReport {
@@ -211,6 +263,55 @@ export interface StatusReport {
   schema: number;
   stores: StoreStatus[];
   lastDream: string | null;
+  /** Totals across every store. */
+  totals: {
+    stores: number;
+    cards: number;
+    archived: number;
+    superseded: number;
+    pendingInbox: number;
+    bytes: number;
+  };
+}
+
+/** Portable export bundle (memory_export / GET /api/memory/export). */
+export interface MemoryExportStore {
+  slug: string;
+  kind: 'global' | 'project';
+  projectPath: string | null;
+  /** Live cards, newest first. */
+  cards: MemoryCard[];
+  /** Archived cards included for a full backup; empty when `liveOnly`. */
+  archived: MemoryCard[];
+}
+
+export interface MemoryExportBundle {
+  format: 'dsh-memory-export';
+  /** Bundle format version (independent of the store schema). */
+  version: number;
+  exportedAt: string;
+  /** Store schema at export time (a mismatched import is still parsed leniently). */
+  schema: number;
+  stores: MemoryExportStore[];
+}
+
+/** Outcome of one import into one store. */
+export interface MemoryImportStoreResult {
+  slug: string;
+  kind: 'global' | 'project';
+  added: number;
+  /** Cards already present with identical content (id + digest). */
+  skipped: number;
+  /** Same id, different content — the imported version replaces it. */
+  replaced: number;
+  /** Cards refused by the policy gate or malformed (never written). */
+  rejected: number;
+  errors: string[];
+}
+
+export interface MemoryImportResult {
+  totals: { added: number; skipped: number; replaced: number; rejected: number };
+  stores: MemoryImportStoreResult[];
 }
 
 /** Raised when a capture is refused by the policy stack (secrets/rules). */

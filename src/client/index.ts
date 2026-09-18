@@ -1,19 +1,17 @@
 /**
  * dsh-memory plugin, browser half.
  *
- * Registers the `memory` settings card into the plugin-configuration section
- * (`settings.plugin.item`), keyed by the settings namespace it edits — the
- * tab pairs the served namespace with the card registered under that key —
- * and the Memory page into the settings nav (`settings.section`). No memory
- * LOGIC runs in the browser: every read/write goes to the Host.
+ * Registers the `memory` settings card as a tab of the Plugins settings
+ * section (`settings.plugins.tab`) and the Memory page into the settings nav
+ * (`settings.section`). No memory LOGIC runs in the browser: every
+ * read/write goes to the Host.
  */
 import type { Context } from '@deepseek-ai/cordis';
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client';
-// Type-only: pulls the settings-surface SlotMap merge and ctx.settingsScope.
+// Type-only: pulls the settings-surface SlotMap merge (`settings.section`,
+// `settings.plugins.tab`) and ctx.settingsScope.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client';
-// Type-only: pulls the `settings.plugin.item` SlotMap merge.
-import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client';
 // Type-only: pulls the `ctx.slots` SlotRegistry merge.
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 import type { MemorySettings } from '../settings.ts';
@@ -52,15 +50,18 @@ export function apply(ctx: Context): void {
   const controller = new MemorySettingsCardController(scope);
   const pageController = new MemoryPageController(scope);
 
-  // Plugin configuration card: one staged form over the `memory` settings
-  // namespace, contributed to the plugin-configuration section (Settings →
-  // Plugins). `settings.plugin.item` is a keyed slot — the dispatch key is
-  // the settings namespace the card edits.
-  ctx.slots.inject('settings.plugin.item', () =>
+  // Plugin configuration tab: one staged form over the `memory` settings
+  // namespace, contributed to the Plugins settings section (Settings →
+  // Plugins). `settings.plugins.tab` is a list slot — each contribution is a
+  // tab whose body is its own component, so the card carries no dispatch key
+  // any more (it binds the `memory` namespace itself through the scope).
+  ctx.slots.inject('settings.plugins.tab', () =>
     ctx.slots.register(
       {
-        name: 'settings.plugin.item',
-        key: SETTINGS_NS,
+        name: 'settings.plugins.tab',
+        id: 'memory',
+        order: 20,
+        label: () => ctx.locale.bind(NS)('card.title'),
         locale: NS,
         inject: () => controller.inject(),
       },

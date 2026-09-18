@@ -13,6 +13,8 @@ export interface BriefOptions {
   maxBytes: number;
   projectK: number;
   globalK: number;
+  /** Include cards the agent already superseded (default false). */
+  includeSuperseded?: boolean;
 }
 
 const FRAME_OPEN = '<system-reminder>';
@@ -30,12 +32,25 @@ export async function buildBrief(core: MemoryCore, opts: BriefOptions): Promise<
 
   const [globalHits, projectHits] = await Promise.all([
     opts.globalK > 0
-      ? core.recall('', { scope: 'global', k: opts.globalK }).then((r) => r.hits)
+      ? core
+          .recall('', {
+            scope: 'global',
+            k: opts.globalK,
+            expandLinks: false,
+            filter: { includeSuperseded: opts.includeSuperseded === true },
+          })
+          .then((r) => r.hits)
       : Promise.resolve([]),
     opts.projectSlug !== null && opts.projectK > 0
-      ? core.recall('', { scope: 'both', projectSlug: opts.projectSlug, k: opts.projectK }).then((r) =>
-          r.hits.filter((h) => h.store === opts.projectSlug),
-        )
+      ? core
+          .recall('', {
+            scope: 'both',
+            projectSlug: opts.projectSlug,
+            k: opts.projectK,
+            expandLinks: false,
+            filter: { includeSuperseded: opts.includeSuperseded === true },
+          })
+          .then((r) => r.hits.filter((h) => h.store === opts.projectSlug))
       : Promise.resolve([]),
   ]);
 

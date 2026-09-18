@@ -38,7 +38,7 @@ import type { MemoryCore } from './core.ts';
 import type { MemoryStore } from './store.ts';
 import type { StoreLogger } from './store.ts';
 import { bm25Score, tokenize } from './retrieval.ts';
-import type { CardMeta, InboxEntry, MemoryCard } from './types.ts';
+import { MemoryPolicyError, type CardMeta, type InboxEntry, type MemoryCard } from './types.ts';
 
 // ── view types (single source for Host handlers and Client imports) ───────
 
@@ -49,15 +49,47 @@ export interface BrowseStoreSummary {
   projectPath: string | null;
   cards: number;
   archived: number;
+  /** Live cards kept as history after a correction. */
+  superseded: number;
   pendingInbox: number;
   lastDream: string | null;
+  /** Live-card histogram per kind. */
+  kinds: Partial<Record<string, number>>;
+  /** Most frequent tags over live cards. */
+  topTags: { tag: string; count: number }[];
+  /** Bytes of the live card files. */
+  bytes: number;
 }
 
 export interface BrowseSummary {
   enabled: boolean;
   schema: number;
   lastDream: string | null;
+  totals: {
+    stores: number;
+    cards: number;
+    archived: number;
+    superseded: number;
+    pendingInbox: number;
+    bytes: number;
+  };
   stores: BrowseStoreSummary[];
+}
+
+/** One audit row (content-free: ids, ops and short titles only). */
+export interface BrowseAuditEntry {
+  ts: string;
+  store: string;
+  op: string;
+  id: string | null;
+  detail: string | null;
+  via: string;
+  session: string | null;
+}
+
+export interface BrowseAuditList {
+  store: string;
+  entries: BrowseAuditEntry[];
 }
 
 /** One card row of the browse list (CardMeta minus path/digest/tokens). */
@@ -115,11 +147,25 @@ export interface BrowseArchiveList {
   cards: BrowseArchivedCard[];
 }
 
-/** Result of one per-card mutation (v2). */
+/** Result of one per-card mutation (v2+). */
 export interface BrowseCardActionResult {
   store: string;
   id: string;
-  mode: 'archive' | 'hard-delete' | 'restore';
+  mode: 'archive' | 'hard-delete' | 'restore' | 'update' | 'create';
+  /** The new card's title (create/update). */
+  title?: string;
+  /** Ids this write superseded (update). */
+  superseded?: string[];
+}
+
+/** Result of one explicit Dream run from the GUI. */
+export interface BrowseDreamResult {
+  started: boolean;
+  busy: boolean;
+  ts: string;
+  durationMs: number;
+  llmCalls: number;
+  stores: { slug: string; added: number; updated: number; noop: number; archived: number; superseded: number; blocked: number; relinked: number; error: string }[];
 }
 
 // ── handlers ──────────────────────────────────────────────────────────────
@@ -130,6 +176,8 @@ export interface MemoryBrowseDeps {
   /** Live `memory.enabled` flag; reported in the summary, never gates reads. */
   isEnabled: () => boolean;
   logger: StoreLogger;
+  /** Trigger one Dream run (POST /api/memory/dream). Optional. */
+  runDream?: (() => Promise<unknown>) | undefined;
 }
 
 type Handler = (request: Request) => Promise<Response>;
@@ -198,11 +246,13 @@ function limitOf(params: URLSearchParams, def = 50, max = 200): number {
 
 /** The mutation bodies are tiny; reject anything beyond this early. */
 const MAX_MUTATION_BODY_BYTES = 4096;
+/** Bundles (import) are larger but still bounded. */
+const MAX_IMPORT_BODY_BYTES = 8 * 1024 * 1024;
 
 /** Parse a small JSON object body; 400 on size overflow or malformed JSON. */
-async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
+async function readJsonBody(request: Request, maxBytes = MAX_MUTATION_BODY_BYTES): Promise<Record<string, unknown>> {
   const buffer = await request.arrayBuffer();
-  if (buffer.byteLength > MAX_MUTATION_BODY_BYTES) throw badRequest('body too large');
+  if (buffer.byteLength > maxBytes) throw badRequest('body too large');
   if (buffer.byteLength === 0) throw badRequest('missing JSON body');
   let parsed: unknown;
   try {
@@ -243,8 +293,8 @@ function cardSummary(id: string, meta: CardMeta, score: number | null): BrowseCa
 }
 
 /**
- * Build the seven route handlers over one MemoryCore (5 GET + 2 POST).
- * @param deps - core, live enabled flag, and the logger.
+ * Build every route handler over one MemoryCore (7 GET + 6 POST).
+ * @param deps - core, live enabled flag, logger, optional Dream trigger.
  */
 export function makeBrowseHandlers(deps: MemoryBrowseDeps): {
   summary: Handler;
@@ -252,8 +302,14 @@ export function makeBrowseHandlers(deps: MemoryBrowseDeps): {
   card: Handler;
   inbox: Handler;
   archive: Handler;
+  audit: Handler;
+  exportBundle: Handler;
   forgetCard: Handler;
   restoreCard: Handler;
+  rememberCard: Handler;
+  updateCard: Handler;
+  dream: Handler;
+  importBundle: Handler;
 } {
   const summary: Handler = (request) =>
     safe(deps, async () => {
@@ -263,14 +319,19 @@ export function makeBrowseHandlers(deps: MemoryBrowseDeps): {
         enabled,
         schema: report.schema,
         lastDream: report.lastDream,
+        totals: report.totals,
         stores: report.stores.map((s) => ({
           slug: s.slug,
           kind: s.kind,
           projectPath: s.projectPath ?? null,
           cards: s.cards,
           archived: s.archived,
+          superseded: s.superseded,
           pendingInbox: s.pendingInbox,
           lastDream: s.lastDream,
+          kinds: s.kinds,
+          topTags: s.topTags,
+          bytes: s.bytes,
         })),
       };
       return json(body);
@@ -384,7 +445,178 @@ export function makeBrowseHandlers(deps: MemoryBrowseDeps): {
       return json(out);
     });
 
-  return { summary, cards, card, inbox, archive, forgetCard, restoreCard };
+  // ── v3 write paths: update / create / dream / import, audit / export reads ─
+
+  /** Recent audit rows for one store (newest first). */
+  const audit: Handler = (request) =>
+    safe(deps, async () => {
+      const url = new URL(request.url);
+      const store = requireStore(deps.core, url.searchParams);
+      const limit = limitOf(url.searchParams, 50, 500);
+      const entries = await deps.core.auditTail(store.slug, limit);
+      const body: BrowseAuditList = {
+        store: store.slug,
+        entries: entries.map((e) => ({
+          ts: e.ts,
+          store: e.store,
+          op: e.op,
+          id: e.id ?? null,
+          detail: e.detail ?? null,
+          via: e.via,
+          session: e.session ?? null,
+        })),
+      };
+      return json(body);
+    });
+
+  /** Portable export bundle (JSON). `store` optional; `liveOnly=1` drops archive. */
+  const exportBundle: Handler = (request) =>
+    safe(deps, async () => {
+      const url = new URL(request.url);
+      const slug = (url.searchParams.get('store') ?? '').trim();
+      if (slug !== '' && deps.core.storeBySlug(slug) === null) throw notFound(`unknown store: ${slug}`);
+      const liveOnly = url.searchParams.get('liveOnly') === '1';
+      const bundle = await deps.core.exportBundle({ slugs: slug !== '' ? [slug] : undefined, liveOnly });
+      return json(bundle);
+    });
+
+  /** Create one card from the GUI (policy gate + audit, same path as the tool). */
+  const rememberCard: Handler = (request) =>
+    safe(deps, async () => {
+      const body = await readJsonBody(request);
+      const store = requireStoreBody(deps.core, body);
+      const content = typeof body.content === 'string' ? body.content : '';
+      if (content.trim() === '') throw badRequest('missing content field');
+      let out: Awaited<ReturnType<MemoryCore['remember']>>;
+      try {
+        out = await deps.core.remember(
+          {
+            content,
+            kind: typeof body.kind === 'string' ? body.kind : undefined,
+            tags: Array.isArray(body.tags) ? body.tags : undefined,
+            importance: typeof body.importance === 'number' ? body.importance : undefined,
+            targetSlug: store.slug,
+            maxBytes: 65536,
+          },
+          'client',
+        );
+      } catch (err) {
+        if (err instanceof MemoryPolicyError) throw badRequest(`blocked by policy: ${err.reasons.join(', ')}`);
+        throw err;
+      }
+      const result: BrowseCardActionResult = {
+        store: out.slug,
+        id: out.card.id,
+        mode: 'create',
+        title: out.card.title,
+      };
+      return json(result, 201);
+    });
+
+  /** Write a corrected version of one card (bitemporal supersede). */
+  const updateCard: Handler = (request) =>
+    safe(deps, async () => {
+      const body = await readJsonBody(request, 256 * 1024);
+      const store = requireStoreBody(deps.core, body);
+      const id = requireId(body);
+      const content = typeof body.content === 'string' ? body.content : undefined;
+      let out: Awaited<ReturnType<MemoryCore['updateCard']>>;
+      try {
+        out = await deps.core.updateCard(
+          store.slug,
+          id,
+          {
+            content,
+            kind: typeof body.kind === 'string' ? body.kind : undefined,
+            tags: Array.isArray(body.tags) ? body.tags : undefined,
+            importance: typeof body.importance === 'number' ? body.importance : undefined,
+          },
+          'client',
+        );
+      } catch (err) {
+        if (err instanceof MemoryPolicyError) throw badRequest(`blocked by policy: ${err.reasons.join(', ')}`);
+        throw err;
+      }
+      if (out === null) throw notFound(`card not found in store: ${id}`);
+      const result: BrowseCardActionResult = {
+        store: store.slug,
+        id: out.card.id,
+        mode: 'update',
+        title: out.card.title,
+        superseded: [id],
+      };
+      return json(result);
+    });
+
+  /** Run one Dream consolidation now (same engine the tool and CLI use). */
+  const dream: Handler = (request) =>
+    safe(deps, async () => {
+      if (deps.runDream === undefined) throw badRequest('dream trigger unavailable in this composition');
+      const raw = await deps.runDream();
+      const r = (raw ?? {}) as {
+        ts?: string;
+        durationMs?: number;
+        llmCalls?: number;
+        busy?: boolean;
+        stores?: {
+          slug: string;
+          added: number;
+          updated: number;
+          noop: number;
+          archived: number;
+          superseded?: number;
+          blocked: number;
+          relinked: number;
+          error?: string;
+        }[];
+      };
+      const body: BrowseDreamResult = {
+        started: r.busy !== true,
+        busy: r.busy === true,
+        ts: r.ts ?? '',
+        durationMs: r.durationMs ?? 0,
+        llmCalls: r.llmCalls ?? 0,
+        stores: (r.stores ?? []).map((s) => ({
+          slug: s.slug,
+          added: s.added,
+          updated: s.updated,
+          noop: s.noop,
+          archived: s.archived,
+          superseded: s.superseded ?? 0,
+          blocked: s.blocked,
+          relinked: s.relinked,
+          error: s.error ?? '',
+        })),
+      };
+      return json(body);
+    });
+
+  /** Import a previously exported bundle (additive + idempotent). */
+  const importBundle: Handler = (request) =>
+    safe(deps, async () => {
+      const body = await readJsonBody(request, MAX_IMPORT_BODY_BYTES);
+      if (body.format !== 'dsh-memory-export' || !Array.isArray(body.stores)) {
+        throw badRequest('not a dsh-memory export bundle');
+      }
+      const result = await deps.core.importBundle(body as never, 'client');
+      return json(result);
+    });
+
+  return {
+    summary,
+    cards,
+    card,
+    inbox,
+    archive,
+    audit,
+    exportBundle,
+    forgetCard,
+    restoreCard,
+    rememberCard,
+    updateCard,
+    dream,
+    importBundle,
+  };
 }
 
 // ── route registration ────────────────────────────────────────────────────
@@ -396,9 +628,36 @@ export const MEMORY_BROWSE_PATHS = {
   card: '/api/memory/card',
   inbox: '/api/memory/inbox',
   archive: '/api/memory/archive',
+  audit: '/api/memory/audit',
+  export: '/api/memory/export',
   forget: '/api/memory/card/forget',
   restore: '/api/memory/card/restore',
+  create: '/api/memory/card/remember',
+  update: '/api/memory/card/update',
+  dream: '/api/memory/dream',
+  import: '/api/memory/import',
 } as const;
+
+/** Every registered route, in registration order (7 GET + 6 POST). */
+export const MEMORY_BROWSE_ROUTES: readonly {
+  path: string;
+  methods: readonly string[];
+  handler: keyof ReturnType<typeof makeBrowseHandlers>;
+}[] = [
+  { path: MEMORY_BROWSE_PATHS.summary, methods: ['GET'], handler: 'summary' },
+  { path: MEMORY_BROWSE_PATHS.cards, methods: ['GET'], handler: 'cards' },
+  { path: MEMORY_BROWSE_PATHS.card, methods: ['GET'], handler: 'card' },
+  { path: MEMORY_BROWSE_PATHS.inbox, methods: ['GET'], handler: 'inbox' },
+  { path: MEMORY_BROWSE_PATHS.archive, methods: ['GET'], handler: 'archive' },
+  { path: MEMORY_BROWSE_PATHS.audit, methods: ['GET'], handler: 'audit' },
+  { path: MEMORY_BROWSE_PATHS.export, methods: ['GET'], handler: 'exportBundle' },
+  { path: MEMORY_BROWSE_PATHS.forget, methods: ['POST'], handler: 'forgetCard' },
+  { path: MEMORY_BROWSE_PATHS.restore, methods: ['POST'], handler: 'restoreCard' },
+  { path: MEMORY_BROWSE_PATHS.create, methods: ['POST'], handler: 'rememberCard' },
+  { path: MEMORY_BROWSE_PATHS.update, methods: ['POST'], handler: 'updateCard' },
+  { path: MEMORY_BROWSE_PATHS.dream, methods: ['POST'], handler: 'dream' },
+  { path: MEMORY_BROWSE_PATHS.import, methods: ['POST'], handler: 'importBundle' },
+];
 
 /** The `connection` service face needed for exact fetch routes. */
 export interface BrowseConnection {
@@ -423,7 +682,7 @@ export interface BrowseCtx {
  * `connection` degrades to a warning; a failed registration disposes whatever
  * was already registered and warns — the rest of the plugin keeps working.
  * @param ctx - the row context (lenient `get` + `effect`).
- * @param deps - core, enabled flag, logger.
+ * @param deps - core, enabled flag, logger, optional Dream trigger.
  */
 export function registerBrowseRoutes(ctx: BrowseCtx, deps: MemoryBrowseDeps): void {
   const connection = ctx.get('connection') as BrowseConnection | undefined;
@@ -432,15 +691,11 @@ export function registerBrowseRoutes(ctx: BrowseCtx, deps: MemoryBrowseDeps): vo
     return;
   }
   const handlers = makeBrowseHandlers(deps);
-  const routes: { path: string; methods: readonly string[]; fetch: Handler }[] = [
-    { path: MEMORY_BROWSE_PATHS.summary, methods: ['GET'], fetch: handlers.summary },
-    { path: MEMORY_BROWSE_PATHS.cards, methods: ['GET'], fetch: handlers.cards },
-    { path: MEMORY_BROWSE_PATHS.card, methods: ['GET'], fetch: handlers.card },
-    { path: MEMORY_BROWSE_PATHS.inbox, methods: ['GET'], fetch: handlers.inbox },
-    { path: MEMORY_BROWSE_PATHS.archive, methods: ['GET'], fetch: handlers.archive },
-    { path: MEMORY_BROWSE_PATHS.forget, methods: ['POST'], fetch: handlers.forgetCard },
-    { path: MEMORY_BROWSE_PATHS.restore, methods: ['POST'], fetch: handlers.restoreCard },
-  ];
+  const routes = MEMORY_BROWSE_ROUTES.map((route) => ({
+    path: route.path,
+    methods: route.methods,
+    fetch: handlers[route.handler] as Handler,
+  }));
   const disposers: Array<() => Promise<void>> = [];
   try {
     for (const route of routes) {

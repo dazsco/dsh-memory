@@ -26,6 +26,7 @@ const KEY_ORDER = [
   'validSince',
   'validUntil',
   'supersedes',
+  'supersededBy',
   'source',
   'links',
 ] as const;
@@ -115,6 +116,7 @@ export function parseCard(text: string, expectedId?: string): MemoryCard {
   const confidence = clampNum(fields.confidence, 0, 1, 0.6);
   const accessCount = clampInt(fields.accessCount, 0, 1_000_000, 0);
   const supersedes = Array.isArray(fields.supersedes) ? fields.supersedes.filter((s) => typeof s === 'string') : [];
+  const supersededBy = typeof fields.supersededBy === 'string' && fields.supersededBy !== '' ? fields.supersededBy : null;
   const links = Array.isArray(fields.links) ? fields.links.filter((s) => typeof s === 'string') : [];
   const sourceRaw = fields.source;
   const source: MemorySource =
@@ -145,6 +147,7 @@ export function parseCard(text: string, expectedId?: string): MemoryCard {
     validSince: assertIso(fields.validSince, 'validSince'),
     validUntil: fields.validUntil === null ? null : assertIso(fields.validUntil, 'validUntil'),
     supersedes,
+    supersededBy,
     source,
     links,
     title,

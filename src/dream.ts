@@ -84,6 +84,8 @@ export interface StoreDreamResult {
   updated: number;
   noop: number;
   archived: number;
+  /** Cards replaced by a newer version (bitemporal supersede, file kept). */
+  superseded: number;
   blocked: number;
   relinked: number;
   notes: string[];
@@ -215,6 +217,7 @@ export class DreamEngine {
       updated: 0,
       noop: 0,
       archived: 0,
+      superseded: 0,
       blocked: 0,
       relinked: 0,
       notes: [],
@@ -334,6 +337,7 @@ export class DreamEngine {
             validSince: ts,
             validUntil: null,
             supersedes: [],
+            supersededBy: null,
             source: entry.source ?? { session: '', turn: null },
             links: [],
             title: firstLine(normText),
@@ -355,9 +359,11 @@ export class DreamEngine {
             accessCount: card.accessCount,
             validUntil: card.validUntil,
             supersedes: card.supersedes,
+            supersededBy: card.supersededBy,
             links: card.links,
             digest: '',
-            tokens: tokens.length,
+            terms: tokens,
+            bytes: Buffer.byteLength(`${card.title}\n${card.body}`, 'utf8'),
           };
           corpus.set(card.id, { meta, tokens });
           res.added++;
@@ -380,12 +386,17 @@ export class DreamEngine {
               counts.set(id, c);
             }
           }
-          const index = await store.readIndex();
+          // Corpus metadata, not the on-disk index: pass 1 may have added cards
+          // with `rebuild:false`, so the index file is deliberately stale here.
           for (const [id, c] of counts) {
-            const meta = index.cards[id];
+            const meta = corpus.get(id)?.meta;
             if (!meta) continue;
             // rebuild: false — pass 5 rebuilds the index once for the run.
-            await store.patchCard(id, { accessCount: meta.accessCount + c.n, lastAccessed: c.last }, { rebuild: false });
+            const patched = await store.patchCard(id, { accessCount: meta.accessCount + c.n, lastAccessed: c.last }, { rebuild: false });
+            if (patched !== null) {
+              meta.accessCount += c.n;
+              meta.lastAccessed = c.last;
+            }
           }
           await store.clearAccessLog();
         }
@@ -416,7 +427,10 @@ export class DreamEngine {
         }
 
         // ── pass 4: relink by tag co-occurrence ────────────────────────────
-        const corpusEntries = [...corpus.entries()];
+        // Only LIVE cards participate: linking to a superseded card would
+        // promote history back into recall through the graph.
+        const corpusEntries = [...corpus.entries()].filter(([, c]) => c.meta.validUntil === null);
+        const liveIds = new Set(corpusEntries.map(([id]) => id));
         for (const [id, c] of corpusEntries) {
           const best = corpusEntries
             .filter(([oid]) => oid !== id)
@@ -428,7 +442,8 @@ export class DreamEngine {
             .sort((a, b) => b.shared * 10 + b.sim - (a.shared * 10 + a.sim))
             .slice(0, 5)
             .map((x) => x.oid);
-          if (JSON.stringify(best) !== JSON.stringify(c.meta.links)) {
+          const current = (c.meta.links ?? []).filter((linkId) => liveIds.has(linkId));
+          if (JSON.stringify(best) !== JSON.stringify(current)) {
             // rebuild: false — pass 5 rebuilds the index once for the run.
             const patched = await store.patchCard(id, { links: best }, { rebuild: false });
             if (patched) {
@@ -484,7 +499,7 @@ export class DreamEngine {
           ts: nowIso(),
           store: store.slug,
           op: 'dream',
-          detail: `+${res.added} ~${res.updated} =${res.noop} ↓${res.archived} ⊘${res.blocked} link=${res.relinked}`,
+          detail: `+${res.added} ~${res.updated} =${res.noop} ↓${res.archived} ⊃${res.superseded} ⊘${res.blocked} link=${res.relinked}`,
           via: 'dream',
         });
 
@@ -515,11 +530,9 @@ export class DreamEngine {
     corpus: Map<string, { meta: import('./types.ts').CardMeta; tokens: string[] }>,
     res: StoreDreamResult,
   ): Promise<void> {
-    const ids = [...corpus.keys()];
-    if (ids.length < SUMMARIZE_MIN_CARDS) return;
-    const ranked = [...corpus.entries()]
-      .sort((a, b) => b[1].meta.importance - a[1].meta.importance)
-      .slice(0, SUMMARIZE_MAX_CARDS);
+    const live = [...corpus.entries()].filter(([, c]) => c.meta.validUntil === null);
+    if (live.length < SUMMARIZE_MIN_CARDS) return;
+    const ranked = live.sort((a, b) => b[1].meta.importance - a[1].meta.importance).slice(0, SUMMARIZE_MAX_CARDS);
     const lines: DreamCardLine[] = [];
     for (const [id, { meta }] of ranked) {
       const card = await store.readCard(id).catch(() => null);
@@ -605,19 +618,32 @@ export class DreamEngine {
       const pair = pairs[idx];
       if (pair === undefined || d === 'both') continue;
       const loserId = d === 'a' ? pair.b.id : pair.a.id;
-      const ok = await store.archiveCard(loserId);
-      if (!ok) continue;
+      const winnerId = d === 'a' ? pair.a.id : pair.b.id;
+      const ts = new Date().toISOString();
+      // Bitemporal resolution: the loser keeps its file and gains the
+      // validUntil/supersededBy pair, so it leaves recall while the reason it
+      // disappeared stays auditable and reversible. The winner records the
+      // forward link.
+      const superseded = await store.supersedeCard(loserId, winnerId, ts, { rebuild: false });
+      if (superseded === null) continue;
+      const winnerMeta = corpus.get(winnerId)?.meta;
+      const forward = [...new Set([...(winnerMeta?.supersedes ?? []), loserId])];
+      await store.patchCard(winnerId, { supersedes: forward, updated: ts }, { rebuild: false });
+      if (winnerMeta !== undefined) {
+        winnerMeta.supersedes = forward;
+        winnerMeta.updated = ts;
+      }
       await store.audit({
-        ts: new Date().toISOString(),
+        ts,
         store: store.slug,
-        op: 'archive',
+        op: 'supersede',
         id: loserId,
-        detail: `llm-conflict(kept ${d === 'a' ? pair.a.id : pair.b.id})`,
+        detail: `llm-conflict(kept ${winnerId})`,
         via: 'dream-llm',
       });
       corpus.delete(loserId);
-      res.archived++;
-      res.notes.push(`llm-conflict: archive ${loserId} (kept ${d === 'a' ? pair.a.id : pair.b.id})`);
+      res.superseded++;
+      res.notes.push(`llm-conflict: supersede ${loserId} (kept ${winnerId})`);
     }
   }
 }
@@ -647,6 +673,7 @@ async function writeReport(dreamDir: string, r: { slug: string; ts: string; res:
     `- updated: ${r.res.updated}`,
     `- noop: ${r.res.noop}`,
     `- archived: ${r.res.archived}`,
+    `- superseded: ${r.res.superseded ?? 0}`,
     `- blocked: ${r.res.blocked}`,
     `- relinked: ${r.res.relinked}`,
     r.res.error ? `- **error**: ${r.res.error}` : '',
@@ -673,33 +700,53 @@ function summarize(r: DreamRunResult): string {
   return r.stores.map((s) => `${s.slug}(+${s.added}/~${s.updated}/↓${s.archived})`).join(' ');
 }
 
+/** The timer face Dream needs (cordis TimerService, or a structural fake). */
+export interface DreamTimers {
+  interval?: (fn: () => void, delayMs: number) => () => void;
+  timeout?: (fn: () => void, delayMs: number) => () => void;
+}
+
+/**
+ * Attach the 60 s tick + 30 s startup sweep to an existing engine. Separate
+ * from engine construction so the row can build the engine immediately (tools
+ * and commands need it) and attach timers only once the OPTIONAL timer service
+ * is present — in any mount order.
+ *
+ * @returns the timer disposers. cordis TimerService owns its timers on ITS own
+ *   fiber, so the caller must attach these to an effect to guarantee teardown.
+ */
+export function attachDreamTimers(timers: DreamTimers, engine: DreamEngine, logger: StoreLogger | null): (() => void)[] {
+  const disposers: (() => void)[] = [];
+  const safeTick = () => {
+    void engine.tick().catch((err) => logger?.warn(`[dsh-memory] dream tick failed: ${err instanceof Error ? err.message : String(err)}`));
+  };
+  try {
+    const startup = timers.timeout?.(safeTick, STARTUP_SWEEP_MS);
+    if (startup !== undefined) disposers.push(startup);
+    const tick = timers.interval?.(safeTick, TICK_MS);
+    if (tick !== undefined) disposers.push(tick);
+  } catch (err) {
+    logger?.warn(`[dsh-memory] dream tick registration failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (typeof timers.timeout !== 'function' && typeof timers.interval !== 'function') {
+    logger?.warn('[dsh-memory] timer services unavailable; Dream runs only on explicit triggers (tool / command / client)');
+  }
+  return disposers;
+}
+
 /**
  * Register the Dream tick on the host context: 60s interval + a 30s startup
  * sweep. Returns the engine so callers (tools, settings watch) can trigger
  * runs. All side effects belong to the caller's fiber.
  */
 export function registerDream(
-  ctx: {
-    interval?: (fn: () => void, delayMs: number) => () => void;
-    timeout?: (fn: () => void, delayMs: number) => () => void;
-  },
+  ctx: DreamTimers,
   core: MemoryCore,
   getSettings: () => MemorySettings,
   logger: StoreLogger | null,
   llmDeps: MemoryLlmDeps | null = null,
 ): DreamEngine {
   const engine = new DreamEngine(core, getSettings, logger, llmDeps);
-  const safeTick = () => {
-    void engine.tick().catch((err) => logger?.warn(`[dsh-memory] dream tick failed: ${err instanceof Error ? err.message : String(err)}`));
-  };
-  try {
-    ctx.timeout?.(safeTick, STARTUP_SWEEP_MS);
-    ctx.interval?.(safeTick, TICK_MS);
-  } catch (err) {
-    logger?.warn(`[dsh-memory] dream tick registration failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  if (typeof ctx.timeout !== 'function' && typeof ctx.interval !== 'function') {
-    logger?.warn('[dsh-memory] timer services unavailable; Dream runs only on explicit triggers (tool / client)');
-  }
+  attachDreamTimers(ctx, engine, logger);
   return engine;
 }

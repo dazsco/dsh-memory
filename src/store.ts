@@ -34,7 +34,6 @@ import {
 } from './fsutil.ts';
 import { cardDigest, cardIdFromFileName, parseCard, readCardFile, serializeCard, writeCardFile } from './cards.ts';
 import { tokenize } from './retrieval.ts';
-
 export interface StoreLogger {
   info: (msg: string) => void;
   warn: (msg: string) => void;
@@ -61,6 +60,14 @@ export class MemoryStore {
   readonly slug: string;
   readonly paths: StorePaths;
   private indexCache: { mtime: number; index: MemoryIndex } | null = null;
+  /**
+   * True once a card mutation deferred its index refresh (`rebuild: false`).
+   * While deferred, {@link readIndex} serves the on-disk index as-is: the
+   * caller (Dream) owns the single end-of-run rebuild, and re-running the
+   * disk-consistency check on every intermediate read would turn one run back
+   * into O(N) rebuilds.
+   */
+  private indexDeferred = false;
   private logger: StoreLogger | null;
 
   constructor(
@@ -106,7 +113,7 @@ export class MemoryStore {
 
   // ── index ────────────────────────────────────────────────────────────────
 
-  /** Read the index, rebuilding it when missing (cached by mtime). */
+  /** Read the index, rebuilding it when missing or out of sync (cached by mtime). */
   async readIndex(): Promise<MemoryIndex> {
     const mtime = await mtimeMsSafe(this.paths.index);
     if (mtime !== null && this.indexCache !== null && this.indexCache.mtime === mtime) {
@@ -114,10 +121,36 @@ export class MemoryStore {
     }
     const onDisk = await this.tryReadIndexFile();
     if (onDisk !== null && mtime !== null) {
-      this.indexCache = { mtime, index: onDisk };
-      return onDisk;
+      // Self-heal: a card file added, removed or renamed outside this store's
+      // write paths (hand edit, external tool, restored backup) must not leave
+      // a phantom index. One `readdir` per cache miss is far cheaper than the
+      // O(cards) rebuild it may trigger — and in-place content edits are
+      // caught by the per-card digest/skip logic on the read paths.
+      if (this.indexDeferred || (await this.indexMatchesDisk(onDisk))) {
+        this.indexCache = { mtime, index: onDisk };
+        return onDisk;
+      }
+      return await this.rebuildIndex();
     }
     return await this.rebuildIndex();
+  }
+
+  /** True when the set of card files on disk is exactly the index's key set. */
+  private async indexMatchesDisk(index: MemoryIndex): Promise<boolean> {
+    let names: string[];
+    try {
+      names = await listFiles(this.paths.cards);
+    } catch {
+      return true; // never block a read on a listing failure
+    }
+    let listed = 0;
+    for (const name of names) {
+      const id = cardIdFromFileName(name);
+      if (id === null) continue;
+      if (!Object.prototype.hasOwnProperty.call(index.cards, id)) return false;
+      listed++;
+    }
+    return listed === Object.keys(index.cards).length;
   }
 
   private async tryReadIndexFile(): Promise<MemoryIndex | null> {
@@ -126,6 +159,13 @@ export class MemoryStore {
     try {
       const parsed = JSON.parse(text) as MemoryIndex;
       if (typeof parsed !== 'object' || parsed === null || typeof parsed.cards !== 'object') return null;
+      // Schema gate: a v1 index has no persisted `terms`, so scoring from it
+      // would silently degrade to empty corpora. The index is derived — fall
+      // through to a rebuild instead of migrating in place.
+      if (parsed.schema !== MEMORY_SCHEMA_VERSION) {
+        this.logger?.info(`[dsh-memory] ${this.slug}: index schema ${String(parsed.schema)} → rebuilding (${MEMORY_SCHEMA_VERSION})`);
+        return null;
+      }
       return parsed;
     } catch (err) {
       this.logger?.warn(`[dsh-memory] ${this.slug}: corrupt index, rebuilding: ${(err as Error).message}`);
@@ -150,9 +190,9 @@ export class MemoryStore {
         if (id === null) continue;
         const card = await readCardFile(this.paths.cards, id, this.cardWarn);
         if (card === null) continue; // unreadable/corrupt card: skip, keep the rest
-        const tokens = tokenize(`${card.title}\n${card.body}`);
-        totalTokens += tokens.length;
-        for (const t of new Set(tokens)) df[t] = (df[t] ?? 0) + 1;
+        const terms = tokenize(`${card.title}\n${card.body}`);
+        totalTokens += terms.length;
+        for (const t of new Set(terms)) df[t] = (df[t] ?? 0) + 1;
         cards[id] = {
           path: join(this.paths.cards, `${id}.md`),
           title: card.title,
@@ -166,9 +206,11 @@ export class MemoryStore {
           accessCount: card.accessCount,
           validUntil: card.validUntil,
           supersedes: card.supersedes,
+          supersededBy: card.supersededBy,
           links: card.links,
           digest: cardDigest(card),
-          tokens: tokens.length,
+          terms,
+          bytes: Buffer.byteLength(serializeCard(card), 'utf8'),
         };
       }
       const index: MemoryIndex = {
@@ -183,6 +225,7 @@ export class MemoryStore {
       };
       await writeJsonAtomic(this.paths.index, index);
       this.indexCache = { mtime: (await mtimeMsSafe(this.paths.index)) ?? 0, index };
+      this.indexDeferred = false;
       return index;
     });
   }
@@ -190,16 +233,32 @@ export class MemoryStore {
   /** Invalidate the in-memory index cache (call after external changes). */
   invalidateIndexCache(): void {
     this.indexCache = null;
+    this.indexDeferred = false;
   }
 
-  /** All card metadata + tokens, for scoring passes. */
+  /**
+   * Defer the index refresh for a batched mutation: drop the cache but accept
+   * the on-disk index as-is until the caller's single {@link rebuildIndex}.
+   */
+  private deferIndexCache(): void {
+    this.indexCache = null;
+    this.indexDeferred = true;
+  }
+
+  /**
+   * The scoring corpus for a store: card metadata + token arrays straight from
+   * the derived index. No card file is read here — the index is the single
+   * source (v2 persists `terms`), which turns a recall/Dream scoring pass from
+   * O(cards) filesystem reads into one cached JSON read.
+   *
+   * A card whose `terms` is somehow absent (a hand-edited index) contributes
+   * an empty token array; its metadata still scores on the other components.
+   */
   async cardCorpus(): Promise<Map<string, { meta: CardMeta; tokens: string[] }>> {
     const index = await this.readIndex();
     const out = new Map<string, { meta: CardMeta; tokens: string[] }>();
     for (const [id, meta] of Object.entries(index.cards)) {
-      const card = await readCardFile(this.paths.cards, id, this.cardWarn);
-      if (card === null) continue;
-      out.set(id, { meta, tokens: tokenize(`${card.title}\n${card.body}`) });
+      out.set(id, { meta, tokens: Array.isArray(meta.terms) ? meta.terms : [] });
     }
     return out;
   }
@@ -220,6 +279,9 @@ export class MemoryStore {
       await writeCardFile(this.paths.cards, card);
     });
     if (opts?.rebuild !== false) await this.rebuildIndex();
+    // A deferred rebuild leaves the on-disk index stale; the in-memory cache
+    // must not keep serving the pre-mutation view to later readers.
+    else this.deferIndexCache();
   }
 
   /** Patch mutable fields on an existing card; null when absent or corrupt. */
@@ -249,6 +311,7 @@ export class MemoryStore {
     });
     // Same pattern as putCard: rebuild OUTSIDE the lock (rebuildIndex takes it).
     if (card !== null && opts?.rebuild !== false) await this.rebuildIndex();
+    else if (card !== null) this.deferIndexCache();
     return card;
   }
 
@@ -327,6 +390,114 @@ export class MemoryStore {
     return await readCardFile(this.paths.archive, id, this.cardWarn);
   }
 
+  /**
+   * Bitemporal supersede: stamp `validUntil` and the `supersededBy` back-link
+   * on one card in a single atomic write. The file stays on disk (history is
+   * never destroyed by a correction) and the card drops out of recall, the
+   * brief, and Dream scoring because every read path filters
+   * `validUntil !== null`. Returns the updated card, or null when the target
+   * is absent/corrupt.
+   */
+  async supersedeCard(id: string, byId: string, at: string, opts?: { rebuild?: boolean }): Promise<MemoryCard | null> {
+    const card = await this.locked(async () => {
+      const existing = await readCardFile(this.paths.cards, id, this.cardWarn);
+      if (existing === null) return null;
+      existing.validUntil = existing.validUntil ?? at;
+      existing.supersededBy = byId;
+      existing.updated = at;
+      await writeCardFile(this.paths.cards, existing);
+      return existing;
+    });
+    if (card !== null && opts?.rebuild !== false) await this.rebuildIndex();
+    else if (card !== null) this.deferIndexCache();
+    return card;
+  }
+
+  /**
+   * One import row: write the card only when the id is free (added) or the
+   * stored content differs (replaced). Identical content is a no-op so a
+   * re-import of the same bundle is idempotent.
+   */
+  async importCard(card: MemoryCard): Promise<'added' | 'replaced' | 'skipped'> {
+    const existing = await readCardFile(this.paths.cards, card.id, this.cardWarn);
+    if (existing !== null && cardDigest(existing) === cardDigest(card)) return 'skipped';
+    await this.putCard(card, { rebuild: false });
+    return existing === null ? 'added' : 'replaced';
+  }
+
+  /** Every live card with full content (export / maintenance paths). */
+  async readAllCards(): Promise<MemoryCard[]> {
+    const names = await listFiles(this.paths.cards);
+    const out: MemoryCard[] = [];
+    for (const name of names) {
+      const id = cardIdFromFileName(name);
+      if (id === null) continue;
+      const card = await readCardFile(this.paths.cards, id, this.cardWarn);
+      if (card !== null) out.push(card);
+    }
+    out.sort((a, b) => (a.created < b.created ? 1 : a.created > b.created ? -1 : 0));
+    return out;
+  }
+
+  /** Every archived card with full content (export path). */
+  async readAllArchived(): Promise<MemoryCard[]> {
+    const names = await listFiles(this.paths.archive);
+    const out: MemoryCard[] = [];
+    for (const name of names) {
+      const id = cardIdFromFileName(name);
+      if (id === null) continue;
+      const card = await readCardFile(this.paths.archive, id, this.cardWarn);
+      if (card !== null) out.push(card);
+    }
+    return out;
+  }
+
+  /**
+   * Derived store shape for status/stats: live kind histogram, most frequent
+   * tags, live/superseded split, and content bytes. Reads ONLY the cached
+   * index plus the archive directory listing — no card file is opened.
+   */
+  async stats(): Promise<{
+    cards: number;
+    superseded: number;
+    archived: number;
+    bytes: number;
+    kinds: Partial<Record<import('./types.ts').MemoryKind, number>>;
+    topTags: { tag: string; count: number }[];
+  }> {
+    const index = await this.readIndex().catch(() => null);
+    const kinds: Partial<Record<import('./types.ts').MemoryKind, number>> = {};
+    const tagCounts = new Map<string, number>();
+    let superseded = 0;
+    let bytes = 0;
+    let cards = 0;
+    if (index !== null) {
+      for (const meta of Object.values(index.cards)) {
+        cards++;
+        bytes += typeof meta.bytes === 'number' ? meta.bytes : 0;
+        if (meta.validUntil !== null) {
+          superseded++;
+          continue;
+        }
+        kinds[meta.kind] = (kinds[meta.kind] ?? 0) + 1;
+        for (const tag of meta.tags) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+      }
+    }
+    const archivedNames = await listFiles(this.paths.archive).catch(() => []);
+    const topTags = [...tagCounts.entries()]
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+      .slice(0, 10)
+      .map(([tag, count]) => ({ tag, count }));
+    return {
+      cards,
+      superseded,
+      archived: archivedNames.filter((n) => cardIdFromFileName(n) !== null).length,
+      bytes,
+      kinds,
+      topTags,
+    };
+  }
+
   // ── inbox / audit / access ───────────────────────────────────────────────
 
   async pushInbox(entry: InboxEntry): Promise<void> {
@@ -387,6 +558,18 @@ export class MemoryStore {
     await appendJsonl(this.paths.audit, [entry]);
   }
 
+  /**
+   * The most recent `limit` audit entries, newest first. Lenient: a torn line
+   * is skipped (the audit log is a diagnostic surface, never a hard failure
+   * path). Entries carry ids/actions and a short title detail — never matched
+   * secret content.
+   */
+  async readAuditTail(limit = 50): Promise<AuditEntry[]> {
+    const { entries } = await readJsonlLinesLenient<AuditEntry>(this.paths.audit);
+    const n = Math.max(1, Math.min(500, limit));
+    return entries.slice(Math.max(0, entries.length - n)).reverse();
+  }
+
   /** Cheap recall counter: append ids; Dream folds them into cards. */
   async noteAccess(ids: string[]): Promise<void> {
     if (ids.length === 0) return;
@@ -414,7 +597,7 @@ export class MemoryStore {
       if (typeof parsed !== 'object' || parsed === null || typeof parsed.inboxOffset !== 'number') {
         return { ...EMPTY_STATE, stats: { ...EMPTY_STATE.stats } };
       }
-      return { ...EMPTY_STATE, ...parsed, stats: { ...EMPTY_STATE.stats, ...(parsed.stats ?? {}) } };
+      return { ...EMPTY_STATE, ...parsed, schema: MEMORY_SCHEMA_VERSION, stats: { ...EMPTY_STATE.stats, ...(parsed.stats ?? {}) } };
     } catch {
       return { ...EMPTY_STATE, stats: { ...EMPTY_STATE.stats } };
     }

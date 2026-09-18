@@ -115,8 +115,8 @@ test('full wiring E2E against a fake ctx', async () => {
     T.apply(ctx);
 
     // 1. registration settles (async core init)
-    const ok = await waitFor(() => state.tools.length === 5, { timeoutMs: 8000 });
-    assert.ok(ok, `expected 5 tools, got ${state.tools.length}: ${state.warnings.join(' | ')}`);
+    const ok = await waitFor(() => state.tools.length === 7, { timeoutMs: 8000 });
+    assert.ok(ok, `expected 7 tools, got ${state.tools.length}: ${state.warnings.join(' | ')}`);
     assert.equal(typeof state.registeredNamespace, 'string');
     assert.ok(String(state.registeredNamespace).includes('memory'), 'settings namespace registered');
     const usage = state.sections.find((s) => s.name === 'memory:usage');
@@ -129,7 +129,15 @@ test('full wiring E2E against a fake ctx', async () => {
     const forget = byName.get('memory_forget');
     const status = byName.get('memory_status');
     const dream = byName.get('memory_dream');
-    for (const name of ['memory_remember', 'memory_recall', 'memory_forget', 'memory_status', 'memory_dream']) {
+    for (const name of [
+      'memory_remember',
+      'memory_recall',
+      'memory_get',
+      'memory_update',
+      'memory_forget',
+      'memory_status',
+      'memory_dream',
+    ]) {
       assert.ok(byName.has(name), `tool ${name} registered`);
     }
 
@@ -142,6 +150,36 @@ test('full wiring E2E against a fake ctx', async () => {
     assert.ok(created.id);
     const found = await recall.execute({ query: 'PR 评审人 批准' }, exec('sess-tool'));
     assert.ok(found.hits.some((h) => h.id === created.id), 'recall finds the stored card');
+
+    // 2b. memory_get returns the full card; a malformed id is a miss, not a throw
+    const get = byName.get('memory_get');
+    const fetched = await get.execute({ id: created.id }, exec('sess-tool'));
+    assert.equal(fetched.found, true);
+    assert.equal(fetched.card.id, created.id);
+    assert.ok(fetched.card.body.includes('PR') || fetched.card.title.includes('PR'));
+    const missing = await get.execute({ id: '../../etc/passwd' }, exec('sess-tool'));
+    assert.equal(missing.found, false);
+
+    // 2c. memory_update supersedes the original and the replacement is recalled
+    const update = byName.get('memory_update');
+    const corrected = await update.execute(
+      { id: created.id, content: '团队约定（修订）：PR 必须两个评审人批准，且 CI 必须全绿。' },
+      exec('sess-tool'),
+    );
+    assert.equal(corrected.updated, true);
+    assert.equal(corrected.superseded, created.id);
+    const recalledAfter = await recall.execute({ query: 'PR 评审人 批准' }, exec('sess-tool'));
+    assert.ok(recalledAfter.hits.some((h) => h.id === corrected.id), 'replacement is recalled');
+    assert.ok(!recalledAfter.hits.some((h) => h.id === created.id), 'superseded card is not recalled');
+    // filter through the tool boundary
+    const filtered = await recall.execute({ query: 'PR', kind: 'commitment' }, exec('sess-tool'));
+    assert.ok(filtered.hits.every((h) => h.kind === 'commitment'));
+
+    // 2d. query forget is a dry run through the tool boundary
+    const dryRun = await forget.execute({ query: 'PR 评审人' }, exec('sess-tool'));
+    assert.equal(dryRun.removed.length, 0);
+    assert.ok(Array.isArray(dryRun.candidates) && dryRun.candidates.length >= 1);
+    assert.match(String(dryRun.note), /confirm=true/);
 
     // 3. secrets are blocked by the tool path too (names only in the reason)
     const blocked = await remember.execute({ content: 'password=SuperSecret123 记住' }, exec('sess-tool'));
@@ -196,15 +234,15 @@ test('full wiring E2E against a fake ctx', async () => {
       'captured fact is recallable after Dream',
     );
 
-    // 6. brief injection on agent start (deduped across both events)
+    // 6. brief injection on agent start. agent/created is the single start
+    // event now (startup/resume/clear/compact, carried in payload.source).
     const agent = {
       id: 'agent-1',
       // A fresh session's persisted log is empty at agent start.
       session: { id: 'sess-agent', header: { cwd: null }, snapshotEvents: () => [] },
       inject: (msg) => state.injected.push(msg),
     };
-    emit(ctx, state, 'agent/created', { agent });
-    emit(ctx, state, 'agent/session-start', { agent, source: 'startup' });
+    emit(ctx, state, 'agent/created', { agent, source: 'startup' });
     const injectedOk = await waitFor(() => state.injected.length === 1, { timeoutMs: 8000 });
     assert.ok(injectedOk, `expected exactly one injection (deduped), got ${state.injected.length}`);
     const msg = state.injected[0];
@@ -245,8 +283,7 @@ test('full wiring E2E against a fake ctx', async () => {
       },
       inject: (m) => state.injected.push(m),
     };
-    emit(ctx, state, 'agent/created', { agent: resumedAgent });
-    emit(ctx, state, 'agent/session-start', { agent: resumedAgent, source: 'resume' });
+    emit(ctx, state, 'agent/created', { agent: resumedAgent, source: 'resume' });
     // Give a (buggy) async injection path time to fire; the persisted check
     // must prevent it synchronously.
     await new Promise((r) => setTimeout(r, 500));
@@ -266,7 +303,7 @@ test('full wiring E2E against a fake ctx', async () => {
       },
       inject: (m) => state.injected.push(m),
     };
-    emit(ctx, state, 'agent/session-start', { agent: legacyAgent, source: 'resume' });
+    emit(ctx, state, 'agent/created', { agent: legacyAgent, source: 'resume' });
     const legacyOk = await waitFor(() => state.injected.length === 2, { timeoutMs: 8000 });
     assert.ok(legacyOk, `legacy session briefed on first resume (got ${state.injected.length})`);
     assert.equal(state.injected[1].source.plugin, 'dsh-memory');

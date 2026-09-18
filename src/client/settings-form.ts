@@ -128,6 +128,21 @@ export function textField(path: readonly string[]): CardFieldSpec {
   };
 }
 
+/** A fractional field with an inclusive range (e.g. a 0–1 ratio). An empty draft clears the field; a non-number or out-of-range draft blocks the save. */
+export function ratioField(path: readonly string[], min: number, max: number): CardFieldSpec {
+  return {
+    path,
+    format: (value) => (typeof value === 'number' ? String(value) : ''),
+    parse: (text) => {
+      const trimmed = text.trim();
+      if (trimmed === '') return { kind: 'clear' };
+      const parsed = Number(trimmed);
+      if (!Number.isFinite(parsed) || parsed < min || parsed > max) return undefined;
+      return { kind: 'set', value: parsed };
+    },
+  };
+}
+
 /** A boolean field, edited through true/false draft text; an empty draft inherits. */
 export function booleanField(path: readonly string[]): CardFieldSpec {
   return {

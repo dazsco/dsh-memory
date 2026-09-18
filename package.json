@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory",
-  "description": "DSH memory system plugin: global + per-project memory folders, AGENTS.md memory rules, and background Dream consolidation (sleep-time compute)",
-  "version": "0.2.0",
+  "description": "DSH-native memory plugin: global + per-project memory, AGENTS.md rules, background Dream consolidation, a /memory composer command, and a GUI management surface",
+  "version": "0.3.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -54,7 +54,9 @@
     "plugin",
     "memory",
     "dream",
-    "sleep-time-compute"
+    "sleep-time-compute",
+    "bitemporal",
+    "commands"
   ],
   "dependencies": {
     "@deepseek-ai/cordis": "link:D:/Repos/deepseek-harness/vendor/cordis",

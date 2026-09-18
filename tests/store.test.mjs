@@ -145,12 +145,20 @@ test('F1: recall survives a corrupt card (skips it, keeps the rest)', async () =
     const { hits, counts } = await core.recall('网关 部署', { k: 5 });
     assert.ok(hits.some((h) => h.id === healthyCard.id), 'the healthy card is still recalled');
     assert.ok(!hits.some((h) => h.id === victimCard.id), 'the corrupt card is not served');
-    assert.equal(counts.global, 1, 'corrupt card is out of the corpus');
+    // The corpus is index-backed (v2): a card file corrupted IN PLACE keeps its
+    // index row until a rebuild, so `counts` may still include it. What matters
+    // is that the read path never serves it (asserted above) and that an
+    // explicit rebuild drops it.
+    assert.equal(counts.global, 2, 'corpus is index-backed and still reports both rows');
 
-    // the index rebuild itself is resilient (used by status / browse)
+    // the index rebuild itself is resilient (used by status / browse) and
+    // drops the corrupt entry for real.
     const index = await store.rebuildIndex();
     assert.equal(Object.keys(index.cards).length, 1);
     assert.ok(index.cards[healthyCard.id], 'index holds the healthy card');
+    const after = await core.recall('网关 部署', { k: 5 });
+    assert.equal(after.counts.global, 1, 'after a rebuild the corrupt card is out of the corpus');
+    assert.ok(after.hits.some((h) => h.id === healthyCard.id), 'healthy card still recallable after rebuild');
   });
 });
 

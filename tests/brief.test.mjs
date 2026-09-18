@@ -32,13 +32,14 @@ test('brief includes stored cards and respects the byte budget', async () => {
 });
 
 test('brief protects project lines when the global section overflows the budget', async () => {
-  await withDshHome(async () => {
+  await withDshHome(async (home) => {
     const T = await import('../lib/testing.js');
     const { mkdir, writeFile } = await import('node:fs/promises');
     const { join } = await import('node:path');
-    const { tmpdir } = await import('node:os');
     const core = await T.MemoryCore.create({ logger: null });
-    const project = await mkdir(join(tmpdir(), `proj-brief-test-${Date.now()}`), { recursive: true });
+    // The project root lives INSIDE the per-test DSH home: a shared OS tmpdir
+    // made this case flaky under `node --test`'s parallel file execution.
+    const project = await mkdir(join(home, 'proj-brief-test'), { recursive: true });
     await writeFile(join(project, '.git'), 'fake');
 
     const gLong =
