@@ -7,15 +7,18 @@
  * executed on the Host without a model turn.
  *
  *   /memory                     store + Dream status
- *   /memory status              same
- *   /memory recall <query>      ranked recall over project + global
- *   /memory search <query>      recall across EVERY known store
- *   /memory remember <text>     store a durable memory (project when applicable)
- *   /memory forget <id>         archive one memory (recoverable)
- *   /memory dream               run one Dream consolidation now
- *   /memory help                usage
+ *   /memory status   | 状态      per-store counts, pending captures, last Dream
+ *   /memory recall <query>  | 召回   ranked recall over project + global
+ *   /memory search <query>  | 搜索   recall across EVERY known store
+ *   /memory remember <text> | 写入   store a durable memory
+ *   /memory forget <id>     | 遗忘   archive one memory (recoverable)
+ *   /memory dream           | 整理   run one Dream consolidation now
+ *   /memory help            | 帮助   usage
  *
- * `/remember <text>` is registered as a shortcut for `remember`.
+ * This is the ONLY registered command. The row copy is Chinese because DSH
+ * renders a host command's `description`/`input.hint` verbatim (a third-party
+ * command gets no per-locale lookup), and Chinese subcommand aliases are
+ * accepted alongside the English tokens.
  *
  * No runtime import of the commands package: the service is resolved through
  * the lenient `ctx.get('commands')` and consumed structurally, so the plugin

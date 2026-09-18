@@ -38,7 +38,7 @@ $DSH_HOME/memory/
 | --- | --- |
 | `settings` 服务 | 可实时热重载的 `memory` 命名空间 (GUI + 设置文档) |
 | `tools` 服务 | 7 个面向模型的工具 |
-| `commands` 服务 | 人类在输入框敲的 `/memory …` 与 `/remember …` |
+| `commands` 服务 | 人类在输入框敲的 `/memory …`(单命令, 支持中文子命令别名) |
 | `connection` 服务 | 13 条 exact `/api/memory/*` fetch 路由, 经连接鉴权下发给浏览器 |
 | `timer` 服务 | 60s Dream tick + 30s 启动巡检 (服务出现时随时补挂) |
 | `systemPrompt` 服务 | 静态 `memory:usage` 段 (order 150) |
@@ -135,20 +135,22 @@ dsh plugin add link:D:/path/to/dsh-memory --profile web
 
 ## 输入框命令 (DSH `commands`)
 
-由人类输入, 在 Host 上执行, 不消耗模型轮次:
+由人类输入, 在 Host 上执行, 不消耗模型轮次。**只有一个命令** `/memory`, 子命令承担全部能力 —— 菜单行的描述与输入提示就是中文 (DSH 对宿主命令的文案原样渲染, 第三方命令拿不到按语言切换的查表), 中文子命令别名与英文 token 等价:
 
 ```
-/memory                     store + Dream status
-/memory recall <query>      ranked recall over this project + global
-/memory search <query>      recall across every known store
-/memory remember <text>     store a durable memory
-/memory forget <id>         archive one memory (recoverable)
-/memory dream               run one Dream consolidation now
-/memory help                usage
-/remember <text>            shortcut for /memory remember
+/memory                     store + Dream status (裸调用)
+/memory status   | 状态      各库卡片数、待整理候选、上次 Dream
+/memory recall <query>  | 召回   在当前项目库 + 全局库中检索
+/memory search <query>  | 搜索   在全部已知记忆库中检索
+/memory remember <text> | 写入   写入一条长期记忆
+/memory forget <id>     | 遗忘   归档一条记忆 (可恢复)
+/memory dream           | 整理   立即执行一次 Dream 整理
+/memory help            | 帮助   用法
 ```
 
 策略闸门同样覆盖命令路径: 被拦截的写入返回 `Blocked by policy: <pattern-names>`, 绝不回显命中的内容。
+
+命令没有图标: 输入框菜单行的图标只能来自客户端 `CommandContribution` (`ui-commands`) 或第一方的 `HOST_FACES` 表, 而客户端贡献**不允许与宿主命令同名** (客户端会抛 `contribution /<name> collides with a host command`)。因此想要图标就必须把 `/memory` 整体搬到客户端, 代价是失去可输入子命令、结果文本与非 Web 客户端的可用性 —— 不值得。
 
 ## 设置 (namespace `memory`, GUI: Settings → Plugins → dsh-memory)
 
@@ -173,7 +175,7 @@ dsh plugin add link:D:/path/to/dsh-memory --profile web
 | `recall.k` | `8` | `memory_recall` / `/memory recall` 的默认返回条数 |
 | `recall.expandLinks` / `linkDecay` | `true` / `0.5` | 排序的 1-hop 图扩展及其提升系数 |
 | `recall.briefIncludeSuperseded` | `false` | 会话简报是否包含已被取代的卡片 |
-| `commands.enabled` | `true` | 注册 `/memory` + `/remember` |
+| `commands.enabled` | `true` | 注册 `/memory`(唯一命令; 子命令已覆盖旧的 `/remember`) |
 | `budget.maxCardBytes` / `maxInboxLines` | `4096` / `1000` | 单卡字节上限 / 候选池行数上限 (Dream 每次运行后压缩**已消费**头部; 未消费尾部永不丢弃) |
 | `llm.provider` / `model` | `''` | 逐字段覆盖。解析顺序 (每字段取首个非空): ① 本设置 → ② 会话实时默认模型 (`agent-default-model` 命名空间, 插件随 agent 自身路由走) → ③ 组合行 `llm:` 路由兜底 |
 | `llm.maxOutputTokens` / `timeoutMs` | `2000` / `60000` | 单次辅助调用输出上限 / 超时 |
@@ -234,7 +236,7 @@ npm test           # node --test tests/**/*.test.mjs (138 tests)
 - **Cordis 生命周期**: 每项贡献都通过 `ctx.inject([service])` 注册 (tools / commands / connection / timer / systemPrompt), 因此挂载顺序不再重要, 迟到的可选服务也能绑定。行配置由导出的 `Config` schema 校验。已由 fake-ctx E2E 验证 (用结构化 fake 调用 `apply()`)。
 - **索引 v2 + 自愈**: `index.json` 中保存 `terms`/`bytes`/`supersededBy`; v1 索引在首次读取时重建; 卡片文件在库外被新增/删除/改名会被每次缓存未命中的一次 `readdir` 发现并触发重建。召回/Dream/简报/GUI 不再逐张读取卡片文件。
 - **双时态取代**: `memory_remember{supersedes}`、`memory_update` 以及 Dream 的冲突仲裁都走 `store.supersedeCard` (原子写入 `validUntil` + `supersededBy`, 胜者记录正向链接, 审计 `op:supersede`); `passesFilter` 把取代变成读路径不变量, 可用 `includeSuperseded` 覆盖。
-- **新能力面**: `/memory` + `/remember` 输入框命令 (DSH `commands` 服务); `compaction/summary` → `summary` 候选捕获; 6 条新 fetch 路由 (audit、export、card/remember、card/update、dream、import)。
+- **新能力面**: `/memory` 输入框命令 (DSH `commands` 服务; 单命令、中文行文案、中文子命令别名); `compaction/summary` → `summary` 候选捕获; 6 条新 fetch 路由 (audit、export、card/remember、card/update、dream、import)。
 - **安全**: 导入时每张卡片都重新过当前策略闸门; 按查询遗忘是 dry run; 畸形 id 永远不会进入文件系统路径拼接。
 - **验证**: `npm run typecheck` 无错; `npm run build` 产出 lib/index.js + lib/testing.js + lib/client.js; `npm test` → **138/138** (118 基线 + 20 条新 v3 用例, 覆盖索引迁移、自愈、取代路径、过滤器、链接扩展、导出/导入、dry-run 遗忘、状态结构、压缩捕获、命令面与新路由; 另有 wiring E2E 中 `memory_get` / `memory_update` / 带过滤召回的工具边界用例)。
 - **线上验收 (web profile, 原地升级)**: bundle 安装并激活为 `include:dsh-memory` (`fiberPhase: active`), 写入 profile 的 `dsh.profile.bundles` 与 `dependencies`, 重启后仍然生效, 且零激活告警。随后用插件自身的工具对**真实记忆库**做了验证: `memory_status` 返回新结构 (`schema: 2`、`totals`, 以及每个库的 `superseded`/`kinds`/`topTags`/`bytes`), 覆盖 **7 个库 / 441 张卡片** —— 说明 v1→v2 索引迁移在既有数据上静默完成; `memory_recall` 用 `scope:"all"` 检索了全部库, `minImportance`/`scope` 过滤器可组合; `memory_get` 读出一张 v2 之前的卡片并显示 `supersededBy: null`, 证明对真实旧文件的向后兼容。

@@ -38,7 +38,7 @@ $DSH_HOME/memory/
 | --- | --- |
 | `settings` service | the live-hot-reloadable `memory` namespace (GUI + settings document) |
 | `tools` service | 7 model-facing tools |
-| `commands` service | `/memory …` and `/remember …` typed by the **human** in the composer |
+| `commands` service | `/memory …` typed by the **human** in the composer (one command, Chinese subcommand aliases) |
 | `connection` service | 13 exact `/api/memory/*` fetch routes served to the browser through the connection's auth |
 | `timer` service | 60 s Dream tick + 30 s startup sweep (patched in whenever the service appears) |
 | `systemPrompt` service | a static `memory:usage` section (order 150) |
@@ -135,20 +135,22 @@ The composition row can override the auxiliary LLM route:
 
 ## Composer commands (DSH `commands`)
 
-Typed by the human, executed on the Host without a model turn:
+Typed by the human, executed on the Host without a model turn. **One command**, `/memory`, with subcommands — the row's description and input hint are Chinese because DSH renders a host command's copy verbatim (a third-party command gets no per-locale lookup), and Chinese subcommand aliases are accepted alongside the English tokens:
 
 ```
-/memory                     store + Dream status
-/memory recall <query>      ranked recall over this project + global
-/memory search <query>      recall across every known store
-/memory remember <text>     store a durable memory
-/memory forget <id>         archive one memory (recoverable)
-/memory dream               run one Dream consolidation now
-/memory help                usage
-/remember <text>            shortcut for /memory remember
+/memory                     store + Dream status (bare invocation)
+/memory status   | 状态      per-store counts, pending captures, last Dream
+/memory recall <query>  | 召回   ranked recall over this project + global
+/memory search <query>  | 搜索   recall across every known store
+/memory remember <text> | 写入   store a durable memory
+/memory forget <id>     | 遗忘   archive one memory (recoverable)
+/memory dream           | 整理   run one Dream consolidation now
+/memory help            | 帮助   usage
 ```
 
 The policy gate covers the command path too: a blocked write returns `Blocked by policy: <pattern-names>` and never echoes the matched content.
+
+No command icon: the composer menu takes a row's icon either from a client-side `CommandContribution` (`ui-commands`) or from the first-party `HOST_FACES` map, and a contribution may not share a name with a host command (the client throws `contribution /<name> collides with a host command`). An icon is therefore only reachable by moving `/memory` entirely to the client, which would lose typed subcommands, result text, and availability outside the Web client — not worth it.
 
 ## Settings (namespace `memory`, GUI: Settings → Plugins → dsh-memory)
 
@@ -173,7 +175,7 @@ The policy gate covers the command path too: a blocked write returns `Blocked by
 | `recall.k` | `8` | default result count for `memory_recall` / `/memory recall` |
 | `recall.expandLinks` / `linkDecay` | `true` / `0.5` | 1-hop graph expansion of the ranking and its promotion factor |
 | `recall.briefIncludeSuperseded` | `false` | include superseded cards in the session brief |
-| `commands.enabled` | `true` | register `/memory` + `/remember` |
+| `commands.enabled` | `true` | register `/memory` (the only command; subcommands cover the old `/remember`) |
 | `budget.maxCardBytes` / `maxInboxLines` | `4096` / `1000` | per-card byte cap / inbox line cap (Dream compacts the **consumed** head after each run; the unconsumed tail is never dropped) |
 | `llm.provider` / `model` | `''` | per-field override. Resolution order, first non-empty per field: ① this setting → ② the session's live default model (`agent-default-model` namespace, so the plugin rides the route the agent itself uses) → ③ the composition-row `llm:` route as last resort |
 | `llm.maxOutputTokens` / `timeoutMs` | `2000` / `60000` | per auxiliary call: output cap / deadline |
@@ -235,7 +237,7 @@ Audit-driven fixes (see `docs/AUDIT.md`, findings F1–F17); no behavior outside
 - **Cordis lifecycle**: every contribution registers through `ctx.inject([service])` (tools / commands / connection / timer / systemPrompt), so mount order no longer matters and late-arriving optional services still bind. The row config is validated by an exported `Config` schema. Verified by the fake-ctx E2E (`apply()` against structural fakes).
 - **Index v2 + self-heal**: `terms`/`bytes`/`supersededBy` in `index.json`; a v1 index is rebuilt on first read; a card file added/removed/renamed outside the store is detected by one `readdir` per cache miss and triggers a rebuild. Recall/Dream/brief/GUI no longer read every card file.
 - **Bitemporal supersede**: `memory_remember{supersedes}`, `memory_update`, and Dream's conflict pass all go through `store.supersedeCard` (atomic `validUntil` + `supersededBy`, forward link on the winner, audit `op:supersede`); `passesFilter` makes supersession a read-path invariant, overridable with `includeSuperseded`.
-- **New surfaces**: `/memory` + `/remember` composer commands (DSH `commands` service); `compaction/summary` → `summary` candidate capture; 6 new fetch routes (audit, export, card/remember, card/update, dream, import).
+- **New surfaces**: the `/memory` composer command (DSH `commands` service; one command with Chinese row copy and Chinese subcommand aliases); `compaction/summary` → `summary` candidate capture; 6 new fetch routes (audit, export, card/remember, card/update, dream, import).
 - **Safety**: import re-validates every card through the current policy gate; forget-by-query is a dry run; malformed ids never reach a filesystem join.
 - **Verification**: `npm run typecheck` clean; `npm run build` → lib/index.js + lib/testing.js + lib/client.js; `npm test` → **138/138** (118 baseline + 20 new v3 cases covering index migration, self-heal, supersede paths, filters, link expansion, export/import, dry-run forget, status shape, compaction capture, the command surface and the new routes; plus tool-boundary cases for `memory_get` / `memory_update` / filtered recall in the wiring E2E).
 - **Live acceptance (web profile, upgraded in place)**: the bundle installed and activated as `include:dsh-memory` (`fiberPhase: active`), recorded in the profile's `dsh.profile.bundles` and `dependencies` so it survives a restart, with zero activation warnings. The plugin's own tools then ran against the REAL store: `memory_status` reported the new shape (`schema: 2`, `totals`, and per-store `superseded`/`kinds`/`topTags`/`bytes`) across **7 stores / 441 cards**, i.e. the v1→v2 index migration completed silently on existing data; `memory_recall` with `scope:"all"` searched every store and the `minImportance`/`scope` filters composed; `memory_get` returned a full pre-v2 card with `supersededBy: null`, proving backward compatibility on real files.

@@ -11,7 +11,7 @@
  *   1. settings namespace `memory` (live hot-reload, production defaults)
  *   2. MemoryCore (global + discovered project stores)
  *   3. seven model-facing tools                     ← `tools`
- *   4. `/memory` + `/remember` composer commands    ← `commands`
+ *   4. `/memory` composer command (one command, subcommands) ← `commands`
  *   5. GUI browse/management fetch routes           ← `connection`
  *   6. Dream tick (60s interval + 30s startup sweep) ← `timer`
  *   7. turn-end + compaction auto-capture (bus listeners)
