@@ -56,14 +56,47 @@ export interface CommandsCtx {
   get: (name: string) => unknown;
 }
 
+/**
+ * Usage text for the `/memory help` reply. Chinese-first (the composer row is
+ * localized too), but the subcommand TOKENS stay the literal English words —
+ * they are what the user actually types.
+ */
 const HELP = [
-  '/memory status — store counts, pending captures, last Dream',
-  '/memory recall <query> — search this project + global memory',
-  '/memory search <query> — search every known store',
-  '/memory remember <text> — store a durable memory',
-  '/memory forget <id> — archive one memory (recoverable)',
-  '/memory dream — run one Dream consolidation now',
+  '/memory 状态 — 各记忆库卡片数、待整理候选、上次整理时间',
+  '/memory 召回 <关键词> — 在当前项目库 + 全局库中检索',
+  '/memory 搜索 <关键词> — 在全部已知记忆库中检索',
+  '/memory 写入 <内容> — 写入一条长期记忆',
+  '/memory 遗忘 <卡片id> — 归档一条记忆（可恢复）',
+  '/memory 整理 — 立即执行一次 Dream 整理',
+  '',
+  '（子命令也可用英文：status | recall | search | remember | forget | dream）',
 ].join('\n');
+
+/**
+ * The composer row's description. DSH renders a HOST command's `description`
+ * verbatim (no per-locale lookup is available to a third-party command), so
+ * the shipped copy is Chinese; the subcommand tokens stay literal.
+ */
+export const COMMAND_DESCRIPTION = '记忆库：状态 / 召回 / 写入 / 遗忘 / 整理';
+
+/** The composer row's input hint (shown after the command in the menu). */
+export const COMMAND_HINT = '状态 | 召回 <关键词> | 写入 <内容> | 遗忘 <id> | 整理';
+
+/**
+ * Accepted subcommand spellings → canonical verb. Chinese aliases exist so the
+ * help text and what the user types agree.
+ */
+const VERB_ALIASES: Readonly<Record<string, string>> = {
+  状态: 'status',
+  召回: 'recall',
+  搜索: 'search',
+  写入: 'remember',
+  记住: 'remember',
+  遗忘: 'forget',
+  删除: 'forget',
+  整理: 'dream',
+  帮助: 'help',
+};
 
 /** Trim the leading separator and surrounding whitespace off raw input. */
 function payload(rawInput: string): string {
@@ -115,9 +148,11 @@ export function registerMemoryCommands(
   /** Execute one parsed `/memory` line. Never throws: errors become `kind:'error'`. */
   const run = async (invocation: CommandInvocation): Promise<CommandResult> => {
     const st = getSettings();
-    const { verb, rest } = splitVerb(payload(invocation.rawInput ?? ''));
+    const split = splitVerb(payload(invocation.rawInput ?? ''));
+    const verb = split.verb === '' ? 'status' : (VERB_ALIASES[split.verb] ?? split.verb);
+    const rest = split.rest;
     try {
-      switch (verb === '' ? 'status' : verb) {
+      switch (verb) {
         case 'help':
           return { kind: 'success', text: HELP };
         case 'status': {
@@ -212,23 +247,15 @@ export function registerMemoryCommands(
   const disposers: (() => void)[] = [];
   try {
     if (getSettings().commands.enabled) {
+      // Exactly ONE command: `/memory`, with subcommands. A second command
+      // (`/remember`) was redundant — `/memory 写入 <内容>` covers it — and two
+      // rows in the composer menu for one capability is just noise.
       disposers.push(
         commands.register({
           name: 'memory',
-          description: 'dsh-memory: status, recall, remember, forget, dream',
-          input: { hint: 'status | recall <query> | remember <text> | forget <id> | dream' },
+          description: COMMAND_DESCRIPTION,
+          input: { hint: COMMAND_HINT },
           handler: run,
-        }),
-      );
-      disposers.push(
-        commands.register({
-          name: 'remember',
-          description: 'dsh-memory: store one durable memory (shortcut for /memory remember)',
-          input: { hint: '<text>' },
-          handler: (invocation) => {
-            const text = payload(invocation.rawInput ?? '');
-            return run({ ...invocation, rawInput: `remember ${text}` });
-          },
         }),
       );
     }

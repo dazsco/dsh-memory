@@ -76,7 +76,7 @@ export type { DreamLlm, DreamRunOptions, StoreDreamResult, DreamRunResult, Dream
 export { registerCapture, extractIntentSentences, splitSentences, stripSystemReminders, extractSummaryText } from './capture.ts';
 export type { SessionLike, IntentCandidate } from './capture.ts';
 
-export { registerMemoryCommands } from './commands.ts';
+export { registerMemoryCommands, COMMAND_DESCRIPTION, COMMAND_HINT } from './commands.ts';
 export type { CommandsService, CommandsCtx, CommandInvocation } from './commands.ts';
 
 export {

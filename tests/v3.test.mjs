@@ -526,12 +526,21 @@ test('commands: /memory exposes status, remember, recall, forget, dream and help
     const engine = new T.DreamEngine(core, () => settings, quietLogger, null);
     const dispose = T.registerMemoryCommands(ctx, core, () => settings, engine, quietLogger);
     assert.equal(typeof dispose, 'function');
-    assert.deepEqual([...registered.keys()].sort(), ['memory', 'remember']);
+    // Exactly ONE composer command: /memory (with subcommands). The old
+    // /remember shortcut is gone.
+    assert.deepEqual([...registered.keys()], ['memory']);
+    // The composer row copy is Chinese (DSH renders a host command's
+    // description/hint verbatim; third-party commands get no per-locale lookup).
+    const definition = registered.get('memory');
+    assert.equal(definition.description, T.COMMAND_DESCRIPTION);
+    assert.equal(definition.input.hint, T.COMMAND_HINT);
+    assert.match(definition.description, /记忆库/);
+    assert.match(definition.input.hint, /召回/);
 
     const invocation = { agent: { session: { id: 'sess-cmd', header: { cwd: null } } }, rawInput: '' };
     const help = await registered.get('memory').handler({ ...invocation, rawInput: 'help' });
     assert.equal(help.kind, 'success');
-    assert.match(help.text, /recall/);
+    assert.match(help.text, /召回/);
 
     const unknown = await registered.get('memory').handler({ ...invocation, rawInput: 'nope' });
     assert.equal(unknown.kind, 'error');
@@ -540,16 +549,26 @@ test('commands: /memory exposes status, remember, recall, forget, dream and help
     assert.equal(created.kind, 'success');
     assert.match(created.text, /Remembered in global/);
 
-    const shortcut = await registered.get('remember').handler({ ...invocation, rawInput: ' 快捷方式写入的记忆内容。' });
-    assert.equal(shortcut.kind, 'success');
+    // Chinese subcommand aliases resolve to the same verbs.
+    const createdZh = await registered.get('memory').handler({ ...invocation, rawInput: '写入 中文子命令写入的记忆内容。' });
+    assert.equal(createdZh.kind, 'success');
+    assert.match(createdZh.text, /Remembered in global/);
 
     const recalled = await registered.get('memory').handler({ ...invocation, rawInput: 'recall 发布窗口' });
     assert.equal(recalled.kind, 'success');
     assert.match(recalled.text, /发布窗口/);
 
+    const recalledZh = await registered.get('memory').handler({ ...invocation, rawInput: '召回 发布窗口' });
+    assert.equal(recalledZh.kind, 'success');
+    assert.match(recalledZh.text, /发布窗口/);
+
     const status = await registered.get('memory').handler({ ...invocation, rawInput: 'status' });
     assert.equal(status.kind, 'success');
     assert.match(status.text, /dsh-memory:/);
+
+    const statusZh = await registered.get('memory').handler({ ...invocation, rawInput: '状态' });
+    assert.equal(statusZh.kind, 'success');
+    assert.match(statusZh.text, /dsh-memory:/);
 
     const dream = await registered.get('memory').handler({ ...invocation, rawInput: 'dream' });
     assert.equal(dream.kind, 'success');
