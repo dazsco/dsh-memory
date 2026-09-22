@@ -8,7 +8,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import { MemoryFsError, MEMORY_KINDS, type MemoryCard, type MemoryKind, type MemorySource } from './types.ts';
+import { MemoryFsError, MEMORY_KINDS, type CardMeta, type MemoryCard, type MemoryKind, type MemorySource } from './types.ts';
 import { mtimeMsSafe, readTextSafe } from './fsutil.ts';
 import { tokenize } from './retrieval.ts';
 
@@ -174,6 +174,47 @@ export function cardDigest(card: MemoryCard): string {
 /** Rough token count for budgeting/index stats. */
 export function cardTokenCount(card: MemoryCard): number {
   return tokenize(`${card.title}\n${card.body}`).length;
+}
+
+/**
+ * Hard cap on the token array persisted per card in index.json. A card body is
+ * already byte-capped at write time (budget.maxCardBytes), so this only trims
+ * the pathological tail (a 4 KB CJK body tokenizes to >1300 bigrams); it keeps
+ * the derived index — and therefore every read/parse of it — bounded by the
+ * CARD COUNT rather than by total stored bytes.
+ */
+export const INDEX_TERMS_CAP = 1024;
+
+/** Apply {@link INDEX_TERMS_CAP} without copying when already under it. */
+export function capTerms(terms: string[], cap = INDEX_TERMS_CAP): string[] {
+  return terms.length <= cap ? terms : terms.slice(0, cap);
+}
+
+/**
+ * The derived index entry for one card. Single source of truth for
+ * `index.json` rows so a full rebuild and an incremental single-card update
+ * can never disagree on shape or on the terms cap.
+ */
+export function cardMetaOf(card: MemoryCard, cardsDir: string): CardMeta {
+  return {
+    path: join(cardsDir, `${card.id}.md`),
+    title: card.title,
+    kind: card.kind,
+    tags: [...card.tags],
+    importance: card.importance,
+    confidence: card.confidence,
+    created: card.created,
+    updated: card.updated,
+    lastAccessed: card.lastAccessed,
+    accessCount: card.accessCount,
+    validUntil: card.validUntil,
+    supersedes: [...card.supersedes],
+    supersededBy: card.supersededBy,
+    links: [...card.links],
+    digest: cardDigest(card),
+    terms: capTerms(tokenize(`${card.title}\n${card.body}`)),
+    bytes: Buffer.byteLength(serializeCard(card), 'utf8'),
+  };
 }
 
 const CARD_FILE_RE = /^m-\d{8}-[a-z0-9]{4,10}\.md$/;

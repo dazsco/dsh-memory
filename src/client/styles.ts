@@ -37,8 +37,9 @@ const css = `
 .dshMemDescription { color: var(--dsw-alias-label-tertiary); font-size: 13px; line-height: 1.5; }
 .dshMemChevron { color: var(--dsw-alias-label-tertiary); flex: none; transition: transform .16s; }
 .dshMemChevronOpen { transform: rotate(180deg); }
-.dshMemBody { border-top: 1px solid var(--dsw-alias-border-l2); margin: 0 16px; padding-bottom: 8px; }
-.dshMemReadOnly { color: var(--dsw-alias-label-tertiary); margin: 12px 0 0; font-size: 12px; line-height: 1.5; }
+.dshMemBody { margin: 0 16px; padding: 12px 0 8px; }
+.dshMemReadOnly { color: var(--dsw-alias-label-tertiary); margin: 0 0 12px; font-size: 12px; line-height: 1.5; }
+.dshMemUnavailable { color: var(--dsw-alias-label-tertiary); margin: 0; font-size: 13px; line-height: 1.5; }
 .dshMemPending {
   white-space: nowrap;
   background: var(--dsw-alias-bg-module-platform);

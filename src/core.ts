@@ -3,9 +3,10 @@
  *
  * Stores live ONLY under $DSH_HOME/memory (global/ + projects/<slug>/) —
  * nothing is ever written into a project directory. Project roots are
- * discovered by walking up from the session cwd to the nearest `.git`, the
- * same convention dsh-agent-instructions uses for AGENTS.md scopes.
+ * discovered by walking up from the session cwd: `.dsh-memory.json` → `.git`
+ * → conventional root markers (see paths.ts).
  */
+import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
 import type { StoreLogger } from './store.ts';
@@ -13,9 +14,12 @@ import { MemoryStore } from './store.ts';
 import {
   findProjectRoot,
   globalStoreRoot,
+  isValidStoreSlug,
   listProjectSlugs,
+  loadProjectsRegistry,
   memoryRoot,
   registerProjectPath,
+  saveProjectsRegistry,
   storePathsFor,
 } from './paths.ts';
 import { readTextSafe, mtimeMsSafe } from './fsutil.ts';
@@ -30,6 +34,7 @@ import {
   compositeScore,
   expandLinks,
   makeSnippet,
+  mmrPool,
   passesFilter,
   rankWithMmr,
   tokenize,
@@ -37,6 +42,7 @@ import {
   type ScoredCandidate,
 } from './retrieval.ts';
 import { dedupDecide, normalizeMemoryText } from './dedup.ts';
+import { maintainStore, type MaintenanceLimits } from './maintain.ts';
 import {
   MEMORY_SCHEMA_VERSION,
   MEMORY_KINDS,
@@ -44,6 +50,7 @@ import {
   type AuditVia,
   type CardMeta,
   type InboxEntry,
+  type MaintainReport,
   type MemoryCard,
   type MemoryExportBundle,
   type MemoryExportStore,
@@ -52,6 +59,7 @@ import {
   type MemoryKind,
   type RecallHit,
   type StatusReport,
+  type StoreMaintenanceResult,
   type StoreStatus,
 } from './types.ts';
 
@@ -169,7 +177,33 @@ export class MemoryCore {
       await store.init();
       core.projects.set(slug, store);
     }
+    await core.gcOrphanRegistryEntries(slugs);
     return core;
+  }
+
+  /**
+   * Self-heal the registry: an entry whose store folder no longer exists
+   * (e.g. the user deleted the folder manually to purge a project) is
+   * removed, so `projects.json` never accumulates orphans that shadow
+   * re-registration at the same path.
+   */
+  private async gcOrphanRegistryEntries(seenSlugs: string[]): Promise<void> {
+    try {
+      const reg = await loadProjectsRegistry();
+      const seen = new Set(seenSlugs);
+      let changed = false;
+      for (const slug of Object.keys(reg.projects)) {
+        if (seen.has(slug)) continue;
+        const folderGone = (await mtimeMsSafe(join(this.root, 'projects', slug))) === null;
+        if (!folderGone) continue;
+        delete reg.projects[slug];
+        changed = true;
+        this.logger?.info(`[dsh-memory] gc: dropped orphan registry entry ${slug} (store folder absent)`);
+      }
+      if (changed) await saveProjectsRegistry(reg);
+    } catch (err) {
+      this.logger?.warn(`[dsh-memory] registry gc failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   allStores(): MemoryStore[] {
@@ -274,9 +308,10 @@ export class MemoryCore {
     input: RememberInput,
     via: AuditVia,
     sessionId?: string,
-  ): Promise<{ card: MemoryCard; slug: string; path: string; warnings: string[] }> {
+  ): Promise<{ card: MemoryCard; slug: string; path: string; warnings: string[]; note?: string }> {
     const scope = (input.scope ?? 'auto') as 'project' | 'global' | 'auto';
     let store: MemoryStore;
+    let note: string | undefined;
     if (typeof input.targetSlug === 'string' && input.targetSlug !== '') {
       const exact = this.storeBySlug(input.targetSlug);
       if (exact === null) throw new Error(`unknown memory store: ${input.targetSlug}`);
@@ -286,8 +321,16 @@ export class MemoryCore {
     } else {
       const project = await this.projectStoreForCwd(input.cwd);
       if (project === null) {
-        if (scope === 'project') throw new Error('no project memory: cwd has no project root (.git)');
+        if (scope === 'project') {
+          throw new Error(
+            'no project memory: cwd has no project root (.git or a root marker such as pyproject.toml/package.json; ' +
+              'place an empty .dsh-memory.json in the project to declare it explicitly)',
+          );
+        }
+        // Auto-scope silently degrading to global is how project memory went
+        // missing without a trace — say so in the result instead.
         store = this.global;
+        note = 'no project root found from cwd (.git or a root marker) — stored in the global store instead';
       } else {
         store = project;
       }
@@ -348,13 +391,14 @@ export class MemoryCore {
     };
     // Bitemporal correction: the new card is written first, then the target is
     // stamped — a crash between the two leaves a duplicate live card (harmless,
-    // dedupable) rather than an orphaned history hole.
+    // dedupable) rather than an orphaned history hole. Each write refreshes
+    // just its own index entry (incremental), not the whole index.
     if (typeof input.supersedes === 'string' && isValidCardId(input.supersedes)) {
       const target = await store.readCard(input.supersedes);
       if (target === null) throw new Error(`supersede target not found in ${store.slug}: ${input.supersedes}`);
       card.supersedes = [input.supersedes];
-      await store.putCard(card, { rebuild: false });
-      await store.supersedeCard(input.supersedes, card.id, now, { rebuild: false });
+      await store.putCard(card);
+      await store.supersedeCard(input.supersedes, card.id, now);
       await store.audit({
         ts: now,
         store: store.slug,
@@ -364,7 +408,6 @@ export class MemoryCore {
         via,
         session: sessionId,
       });
-      await store.rebuildIndex();
     } else {
       await store.putCard(card);
     }
@@ -377,7 +420,7 @@ export class MemoryCore {
       via,
       session: sessionId,
     });
-    return { card, slug: store.slug, path: join(store.paths.cards, `${card.id}.md`), warnings: gated.warnings };
+    return { card, slug: store.slug, path: join(store.paths.cards, `${card.id}.md`), warnings: gated.warnings, note };
   }
 
   /** Stage one capture in a store's inbox (auto-capture path). */
@@ -480,7 +523,7 @@ export class MemoryCore {
       if (entry.score > 0) scored.push(entry);
     }
 
-    const mmr = rankWithMmr(scored).slice(0, k);
+    const mmr = rankWithMmr(mmrPool(scored, k), 0.3, k);
     const ranked: readonly (ScoredCandidate & { memStore?: MemoryStore })[] =
       opts.expandLinks === false
         ? mmr
@@ -511,10 +554,14 @@ export class MemoryCore {
       arr.push(r.id);
       touched.set(memStore.slug, arr);
     }
-    // Access counters are cheap appends; Dream folds them into card fields.
+    // Access counters feed the ranking's strength term. They are BUFFERED in
+    // the store and appended in one batch once the buffer is worth flushing,
+    // so a recall never pays a file lock + append (and never leaves an
+    // unawaited write behind that can outlive the store's lifetime).
     for (const [slug, ids] of touched) {
       const store = this.storeBySlug(slug);
-      void store?.noteAccess(ids).catch(() => undefined);
+      if (store === null) continue;
+      await store.noteAccess(ids).catch(() => undefined);
     }
     return { hits, counts };
   }
@@ -573,14 +620,12 @@ export class MemoryCore {
           if (ok) {
             removed.push({ slug: store.slug, id: args.id, mode: 'hard-delete' });
             await store.audit({ ts: new Date().toISOString(), store: store.slug, op: 'hard-delete', id: args.id, via, session: sessionId });
-            await store.rebuildIndex();
           }
         } else {
           const ok = await store.archiveCard(args.id);
           if (ok) {
             removed.push({ slug: store.slug, id: args.id, mode: 'archive' });
             await store.audit({ ts: new Date().toISOString(), store: store.slug, op: 'archive', id: args.id, via, session: sessionId });
-            await store.rebuildIndex();
           }
         }
         break;
@@ -663,11 +708,10 @@ export class MemoryCore {
       title,
       body: safe === title ? '' : safe.slice(title.length).trim(),
     };
-    await store.putCard(next, { rebuild: false });
-    await store.supersedeCard(id, next.id, now, { rebuild: false });
+    await store.putCard(next);
+    await store.supersedeCard(id, next.id, now);
     await store.audit({ ts: now, store: store.slug, op: 'supersede', id, detail: `→ ${next.id}`, via, session: sessionId });
     await store.audit({ ts: now, store: store.slug, op: 'create', id: next.id, detail: title.slice(0, 80), via, session: sessionId });
-    await store.rebuildIndex();
     return { card: next, warnings: gated.warnings };
   }
 
@@ -721,7 +765,7 @@ export class MemoryCore {
       if (slug === '') continue;
       let store = this.storeBySlug(slug);
       if (store === null) {
-        if (incoming.kind !== 'project' || !/^[a-z0-9][a-z0-9-]*$/i.test(slug)) {
+        if (incoming.kind !== 'project' || !isValidStoreSlug(slug)) {
           stores.push({ slug, kind: incoming.kind ?? 'project', added: 0, skipped: 0, replaced: 0, rejected: 0, errors: ['unknown store'] });
           continue;
         }
@@ -840,7 +884,6 @@ export class MemoryCore {
       const ok = await store.deleteCardHard(id);
       if (ok) {
         await store.audit({ ts: new Date().toISOString(), store: store.slug, op: 'hard-delete', id, via, session: sessionId });
-        await store.rebuildIndex();
         return 'hard-deleted';
       }
       return null;
@@ -848,7 +891,6 @@ export class MemoryCore {
     const ok = await store.archiveCard(id);
     if (ok) {
       await store.audit({ ts: new Date().toISOString(), store: store.slug, op: 'archive', id, via, session: sessionId });
-      await store.rebuildIndex();
       return 'archived';
     }
     return null;
@@ -865,8 +907,121 @@ export class MemoryCore {
     const ok = await store.restoreCard(id);
     if (!ok) return false;
     await store.audit({ ts: new Date().toISOString(), store: store.slug, op: 'restore', id, via, session: sessionId });
-    await store.rebuildIndex();
     return true;
+  }
+
+  // ── store lifecycle ─────────────────────────────────────────────────────
+
+  /**
+   * Permanently delete ONE project store: cards, archive, Dream history,
+   * inbox, index and audit go away with the directory, and the
+   * `projects.json` entry is removed in the same operation. The global store
+   * can never be dropped. A final `drop-store` audit line is written before
+   * the directory is removed (it is the only surviving trace).
+   *
+   * The in-process root→slug cache entry is cleared too, so a later session
+   * in the same project re-registers a FRESH store instead of resolving the
+   * slug to a dead directory.
+   */
+  async dropStore(
+    slug: string,
+    via: AuditVia,
+    sessionId?: string,
+  ): Promise<{ slug: string; liveCards: number; archivedCards: number; registryRemoved: boolean }> {
+    if (slug === 'global') throw new Error('the global store cannot be dropped');
+    const store = this.storeBySlug(slug);
+    if (store === null) throw new Error(`unknown memory store: ${slug}`);
+    const stats = await store.stats().catch(() => null);
+    const now = new Date().toISOString();
+    await store
+      .audit({
+        ts: now,
+        store: slug,
+        op: 'drop-store',
+        detail: `live=${stats?.cards ?? '?'} archived=${stats?.archived ?? '?'}`,
+        via,
+        session: sessionId,
+      })
+      .catch(() => undefined);
+    await fs.rm(store.paths.root, { recursive: true, force: true });
+    this.projects.delete(slug);
+    for (const [root, s] of [...this.projectSlugCache.entries()]) {
+      if (s === slug) this.projectSlugCache.delete(root);
+    }
+    let registryRemoved = false;
+    try {
+      const reg = await loadProjectsRegistry();
+      if (reg.projects[slug] !== undefined) {
+        delete reg.projects[slug];
+        await saveProjectsRegistry(reg);
+        registryRemoved = true;
+      }
+    } catch (err) {
+      this.logger?.warn(`[dsh-memory] dropStore: registry cleanup failed for ${slug}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    this.logger?.info(`[dsh-memory] dropped store ${slug} (${store.paths.root})`);
+    return { slug, liveCards: stats?.cards ?? 0, archivedCards: stats?.archived ?? 0, registryRemoved };
+  }
+
+  // ── maintenance (GC) ────────────────────────────────────────────────────
+
+  /**
+   * Flush every store's buffered access ids to disk. Called on row teardown
+   * (a few lost access counts are harmless, but a clean shutdown should not
+   * drop them) and before a Dream run folds them into card counters.
+   */
+  async flushAccess(): Promise<void> {
+    for (const store of this.allStores()) {
+      await store.flushAccess().catch(() => undefined);
+    }
+  }
+
+  /**
+   * Capacity maintenance over one, several or every store: archive stale
+   * low-importance cards, enforce the live-card ceiling, prune the archive and
+   * the audit/access logs, and compact the consumed inbox head.
+   *
+   * `dryRun` (the default at the call sites) computes and reports the exact
+   * same selection without changing anything on disk — the safe way to see
+   * what a cleanup would cost before running it.
+   */
+  async maintain(opts: {
+    limits: MaintenanceLimits;
+    /** Restrict to these store slugs (default: every known store). */
+    slugs?: readonly string[];
+    dryRun?: boolean;
+    /** Wall-clock deadline (ms since epoch) for the per-store card sweeps. */
+    deadline?: number;
+  }): Promise<MaintainReport> {
+    const wanted = opts.slugs !== undefined && opts.slugs.length > 0 ? new Set(opts.slugs) : null;
+    const stores: StoreMaintenanceResult[] = [];
+    for (const store of this.allStores()) {
+      if (wanted !== null && !wanted.has(store.slug)) continue;
+      try {
+        stores.push(
+          await maintainStore(store, {
+            limits: opts.limits,
+            dryRun: opts.dryRun === true,
+            logger: this.logger,
+            deadline: opts.deadline,
+          }),
+        );
+      } catch (err) {
+        this.logger?.warn(
+          `[dsh-memory] maintain ${store.slug} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    const totals = {
+      staleArchived: stores.reduce((n, s) => n + s.staleArchived, 0),
+      budgetArchived: stores.reduce((n, s) => n + s.budgetArchived, 0),
+      archivePruned: stores.reduce((n, s) => n + s.archivePruned, 0),
+      auditPruned: stores.reduce((n, s) => n + s.auditPruned, 0),
+      accessPruned: stores.reduce((n, s) => n + s.accessPruned, 0),
+      inboxDropped: stores.reduce((n, s) => n + s.inboxDropped, 0),
+      bytesReclaimed: stores.reduce((n, s) => n + s.bytesReclaimed, 0),
+    };
+    return { dryRun: opts.dryRun === true, stores, totals };
   }
 
   // ── status ──────────────────────────────────────────────────────────────

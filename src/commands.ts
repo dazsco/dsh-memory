@@ -12,6 +12,8 @@
  *   /memory search <query>  | 搜索   recall across EVERY known store
  *   /memory remember <text> | 写入   store a durable memory
  *   /memory forget <id>     | 遗忘   archive one memory (recoverable)
+ *   /memory gc [confirm]    | 清理   capacity cleanup (dry run unless confirmed)
+ *   /memory drop <slug>     | 删除库  permanently delete one project store
  *   /memory dream           | 整理   run one Dream consolidation now
  *   /memory help            | 帮助   usage
  *
@@ -26,6 +28,7 @@
  */
 import type { StoreLogger } from './store.ts';
 import type { MemoryCore } from './core.ts';
+import { maintenanceLimitsFrom } from './maintain.ts';
 import type { MemorySettings } from './settings.ts';
 import type { DreamEngine } from './dream.ts';
 import { MemoryPolicyError } from './types.ts';
@@ -70,9 +73,11 @@ const HELP = [
   '/memory 搜索 <关键词> — 在全部已知记忆库中检索',
   '/memory 写入 <内容> — 写入一条长期记忆',
   '/memory 遗忘 <卡片id> — 归档一条记忆（可恢复）',
+  '/memory 清理 [slug] [confirm] — 容量清理：试算（默认）或执行；归档过期/超限卡片并裁剪日志与归档',
+  '/memory 删除库 <slug> — 永久删除一个项目记忆库（不可恢复；全局库不可删）',
   '/memory 整理 — 立即执行一次 Dream 整理',
   '',
-  '（子命令也可用英文：status | recall | search | remember | forget | dream）',
+  '（子命令也可用英文：status | recall | search | remember | forget | gc | drop | dream）',
 ].join('\n');
 
 /**
@@ -80,10 +85,10 @@ const HELP = [
  * verbatim (no per-locale lookup is available to a third-party command), so
  * the shipped copy is Chinese; the subcommand tokens stay literal.
  */
-export const COMMAND_DESCRIPTION = '记忆库：状态 / 召回 / 写入 / 遗忘 / 整理';
+export const COMMAND_DESCRIPTION = '记忆库：状态 / 召回 / 写入 / 遗忘 / 清理 / 删除库 / 整理';
 
 /** The composer row's input hint (shown after the command in the menu). */
-export const COMMAND_HINT = '状态 | 召回 <关键词> | 写入 <内容> | 遗忘 <id> | 整理';
+export const COMMAND_HINT = '状态 | 召回 <关键词> | 写入 <内容> | 遗忘 <id> | 清理 [confirm] | 删除库 <slug> | 整理';
 
 /**
  * Accepted subcommand spellings → canonical verb. Chinese aliases exist so the
@@ -97,6 +102,12 @@ const VERB_ALIASES: Readonly<Record<string, string>> = {
   记住: 'remember',
   遗忘: 'forget',
   删除: 'forget',
+  清理: 'gc',
+  清理容量: 'gc',
+  gc: 'gc',
+  删除库: 'drop',
+  删库: 'drop',
+  drop: 'drop',
   整理: 'dream',
   帮助: 'help',
 };
@@ -205,7 +216,8 @@ export function registerMemoryCommands(
             sessionIdOf(invocation),
           );
           const warns = out.warnings.length > 0 ? ` (redacted: ${out.warnings.join(', ')})` : '';
-          return { kind: 'success', text: `Remembered in ${out.slug}: ${out.card.title} (${out.card.id})${warns}` };
+          const note = out.note !== undefined ? `\n注意：${out.note}` : '';
+          return { kind: 'success', text: `Remembered in ${out.slug}: ${out.card.title} (${out.card.id})${warns}${note}` };
         }
         case 'forget': {
           if (!st.enabled) return { kind: 'error', text: 'dsh-memory is disabled (settings: memory.enabled=false).' };
@@ -230,12 +242,68 @@ export function registerMemoryCommands(
             ].join('\n'),
           };
         }
+        case 'drop': {
+          if (!st.enabled) return { kind: 'error', text: 'dsh-memory is disabled (settings: memory.enabled=false).' };
+          const slug = (rest.split(/\s+/)[0] ?? '').trim();
+          if (slug === '') {
+            const projectSlugs = core.allStores().filter((s) => s.kind === 'project').map((s) => s.slug);
+            return {
+              kind: 'error',
+              text: `usage: /memory 删除库 <slug>\n当前项目库：${projectSlugs.length > 0 ? projectSlugs.join(', ') : '（无）'}（全局库不可删除）`,
+            };
+          }
+          if (slug === 'global') return { kind: 'error', text: '全局库不能删除（全局记忆请用逐张遗忘）' };
+          if (core.storeBySlug(slug) === null) {
+            const projectSlugs = core.allStores().filter((s) => s.kind === 'project').map((s) => s.slug);
+            return {
+              kind: 'error',
+              text: `未知记忆库 “${slug}”。当前项目库：${projectSlugs.length > 0 ? projectSlugs.join(', ') : '（无）'}`,
+            };
+          }
+          const res = await core.dropStore(slug, 'command', sessionIdOf(invocation));
+          return {
+            kind: 'success',
+            text: `已永久删除记忆库 ${res.slug}：${res.liveCards} 张卡片 + ${res.archivedCards} 张归档 + 整理历史/收件箱/索引；注册表条目${res.registryRemoved ? '已' : '未'}清理。此操作不可恢复。`,
+          };
+        }
+        case 'gc': {
+          if (!st.enabled) return { kind: 'error', text: 'dsh-memory is disabled (settings: memory.enabled=false).' };
+          const tokens = rest.split(/\s+/).filter((t) => t !== '');
+          const isConfirm = (t: string): boolean => /^(confirm|--confirm|-y|yes|执行|确认)$/i.test(t);
+          const apply = tokens.some(isConfirm);
+          const slugToken = tokens.find((t) => !isConfirm(t)) ?? '';
+          const slug = slugToken === '' || slugToken === 'all' || slugToken === '全部' ? null : slugToken;
+          if (slug !== null && core.storeBySlug(slug) === null) {
+            const slugs = core.allStores().map((s) => s.slug);
+            return { kind: 'error', text: `未知记忆库 “${slug}”。当前记忆库：${slugs.join(', ')}` };
+          }
+          const report = await core.maintain({
+            limits: maintenanceLimitsFrom(st),
+            slugs: slug !== null ? [slug] : undefined,
+            dryRun: !apply,
+          });
+          const lines = report.stores.map(
+            (s) =>
+              `- ${s.slug}: 归档 stale ${s.staleArchived} + 超限 ${s.budgetArchived} · 删归档 ${s.archivePruned} · ` +
+              `审计 ${s.auditPruned} · 访问 ${s.accessPruned} · 收件箱 ${s.inboxDropped} · 约 ${s.bytesReclaimed}B`,
+          );
+          return {
+            kind: 'success',
+            text: [
+              report.dryRun ? '容量清理试算（未改动任何文件）：' : '容量清理完成：',
+              ...lines,
+              report.dryRun ? '确认执行：/memory 清理 confirm（可加 slug 只清理一个库）' : '',
+            ]
+              .filter((l) => l !== '')
+              .join('\n'),
+          };
+        }
         case 'dream': {
           if (!st.enabled) return { kind: 'error', text: 'dsh-memory is disabled (settings: memory.enabled=false).' };
           if (!st.dream.enabled) return { kind: 'error', text: 'Dream is disabled (settings: memory.dream.enabled=false).' };
           const res = await engine.runNow({ reason: 'command', llm: engine.llmForRun() });
           if (res.busy) return { kind: 'success', text: 'A Dream run is already in flight.' };
-          const lines = res.stores.map((s) => `- ${s.slug}: +${s.added} ~${s.updated} =${s.noop} ↓${s.archived} ⊃${s.superseded} ⊘${s.blocked} link=${s.relinked}`);
+          const lines = res.stores.map((s) => `- ${s.slug}: +${s.added} ~${s.updated} =${s.noop} ↓${s.archived} ⊃${s.superseded} ⊘${s.blocked} link=${s.relinked} gc=${s.pruned}`);
           return { kind: 'success', text: [`Dream finished in ${res.durationMs} ms (llm calls: ${res.llmCalls}).`, ...lines].join('\n') };
         }
         default:

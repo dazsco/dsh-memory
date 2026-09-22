@@ -16,7 +16,23 @@
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
 import { deepFreeze } from '@deepseek-ai/dsh-util-values';
 import { deadline, timeoutOf } from '@deepseek-ai/dsh-timeout';
-import type { StreamChunk, UserMessage } from '@deepseek-ai/dsh-llm';
+import type { ContextFormed, StreamChunk, UserMessage } from '@deepseek-ai/dsh-llm';
+
+// Message attribution is producer-owned in this harness: there is no shared
+// catch-all `plugin` kind any more, so this plugin declares its own and every
+// consumer falls through unknown kinds.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** Content this plugin produced: auxiliary extraction calls and the session brief. */
+    'dsh-memory': { kind: 'dsh-memory' } & ContextFormed;
+  }
+}
+
+/** Source of an auxiliary memory model call (an undeclared form is the default). */
+export const MEMORY_AUX_SOURCE = { kind: 'dsh-memory' } as const;
+
+/** Source of the session brief: material recalled out of the memory stores. */
+export const MEMORY_BRIEF_SOURCE = { kind: 'dsh-memory', form: 'recall' } as const;
 
 const TIMEOUT_CODE = 'MEMORY_LLM_TIMEOUT';
 
@@ -79,7 +95,7 @@ export async function callMemoryLlm(deps: MemoryLlmDeps, request: MemoryLlmReque
   const messages: UserMessage[] = [
     createUserMessage({
       content: [{ type: 'text', text: request.user }],
-      source: { kind: 'plugin', plugin: 'dsh-memory' },
+      source: MEMORY_AUX_SOURCE,
     }),
   ];
   const callDeadline = deadline(undefined, live.timeoutMs, TIMEOUT_CODE);

@@ -153,24 +153,60 @@ export interface ScoredCandidate {
   score: number;
 }
 
-/** Rank candidates across stores with MMR diversity penalty. */
-export function rankWithMmr(candidates: ScoredCandidate[], mmrLambda = 0.3): ScoredCandidate[] {
+/**
+ * Candidate-pool bounds for MMR. Greedy MMR is O(pool × selected) jaccard
+ * intersections; run over EVERY candidate and it becomes O(N²) with N growing
+ * forever (the "memory got slow after a few hundred turns" failure). Only the
+ * top-k are ever returned, so the pool is pre-cut by score: a multiple of k,
+ * with a floor so a tiny k still has enough diversity to choose from.
+ */
+export const MMR_POOL_MIN = 240;
+export const MMR_POOL_FACTOR = 12;
+
+/**
+ * Keep the best `max(MMR_POOL_MIN, limit × MMR_POOL_FACTOR)` candidates by
+ * score. Returns the input array unchanged when it already fits (no copy).
+ */
+export function mmrPool(candidates: ScoredCandidate[], limit: number): ScoredCandidate[] {
+  const cap = Math.max(MMR_POOL_MIN, Math.max(1, limit) * MMR_POOL_FACTOR);
+  if (candidates.length <= cap) return candidates;
+  return [...candidates].sort((a, b) => b.score - a.score).slice(0, cap);
+}
+
+/**
+ * Rank candidates across stores with MMR diversity penalty.
+ *
+ * `limit` bounds the greedy selection itself (not just the returned slice): the
+ * loop stops after `limit` picks, so the cost is O(pool × limit) instead of
+ * O(N²). Callers that need the full ranking pass the candidate count.
+ */
+export function rankWithMmr(candidates: ScoredCandidate[], mmrLambda = 0.3, limit = candidates.length): ScoredCandidate[] {
+  const target = Math.max(0, Math.min(candidates.length, Math.floor(limit)));
   const selected: ScoredCandidate[] = [];
+  if (target === 0) return selected;
   const pools = new Map<string, ScoredCandidate>(candidates.map((c) => [c.id, c]));
-  const sets = new Map<string, Set<string>>(
-    candidates.map((c) => [c.id, new Set(c.tokens)]),
-  );
-  while (pools.size > 0) {
+  // Token sets are materialized lazily: only candidates actually compared pay
+  // for the Set construction, and each id's set is built at most once.
+  const sets = new Map<string, Set<string>>();
+  const setFor = (c: ScoredCandidate): Set<string> => {
+    let s = sets.get(c.id);
+    if (s === undefined) {
+      s = new Set(c.tokens);
+      sets.set(c.id, s);
+    }
+    return s;
+  };
+  while (pools.size > 0 && selected.length < target) {
     let best: ScoredCandidate | null = null;
     let bestScore = -Infinity;
     for (const c of pools.values()) {
-      let mmr = c.score;
       let bestOverlap = 0;
+      const cSet = setFor(c);
       for (const s of selected) {
-        const o = jaccard(sets.get(c.id)!, sets.get(s.id)!);
+        const o = jaccard(cSet, setFor(s));
         if (o > bestOverlap) bestOverlap = o;
       }
-      mmr = mmrLambda * c.score - (1 - mmrLambda) * bestOverlap;
+      const mmr = mmrLambda * c.score - (1 - mmrLambda) * bestOverlap;
       if (mmr > bestScore) {
         bestScore = mmr;
         best = c;

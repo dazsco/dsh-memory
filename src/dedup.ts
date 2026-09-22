@@ -27,6 +27,14 @@ export function dedupDecide(
   let bestId: string | null = null;
   let bestSim = 0;
   for (const e of existing) {
+    const a = candidateTokens.size;
+    const b = e.tokens.size;
+    if (a === 0 || b === 0) continue;
+    // jaccard(a,b) ≤ min(|a|,|b|)/max(|a|,|b|). Below the UPDATE threshold a
+    // pair can never change the decision (a sub-threshold best match still
+    // yields 'add' with no matchId), so skip the intersection entirely. This
+    // is what keeps ingest O(inbox × cards) instead of O(inbox × cards × tokens).
+    if (Math.min(a, b) / Math.max(a, b) < DEDUP_THRESHOLDS.update) continue;
     const sim = jaccard(candidateTokens, e.tokens);
     if (sim > bestSim) {
       bestSim = sim;

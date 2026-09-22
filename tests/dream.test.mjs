@@ -240,10 +240,13 @@ test('F4: a torn ACCESS log line does not fail the Dream run', async () => {
     const store = core.global;
     const { card } = await core.remember({ content: '访问日志损坏测试卡片。', scope: 'global' }, 'tool', 's1');
     await store.noteAccess([card.id]);
+    // Recall counters are buffered in-process now: flush before poking the file.
+    await store.flushAccess();
     // append a torn half line (terminated, so the next append starts its own line)
     const text = (await T.readTextSafe(store.paths.access)).replace(/\n+$/, '');
     await writeFile(store.paths.access, `${text}\n{"ts":"2026-01-01T00:00:00.000Z","ids":["m-20260101-aaaabbbbcc\n`, 'utf8');
     await store.noteAccess([card.id]);
+    await store.flushAccess();
 
     const engine = new T.DreamEngine(core, () => T.defaultMemorySettings(), null);
     const r = await engine.runNow({ reason: 'test' });

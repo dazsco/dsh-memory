@@ -6,15 +6,15 @@
 # as ONE process-global service: memory is shared across sessions by design,
 # so the provider belongs in the host plane (profile composition), never in an
 # agent preset.
+#
+# The row id is the settings namespace: the plugin declares its whole memory
+# configuration as this row's `Config`, whose volatile fields DSH projects into
+# the live form (Settings → Plugins → dsh-memory). The plugin ships NO `config:`
+# block here on purpose — every field's schema default is the production
+# default, and a value written here would sit in the composition layer and
+# shadow the deployment's own session model for `llm.provider`/`llm.model`.
+# Pin a route by adding `config: { llm: { provider: ..., model: ... } }` to this
+# entry (or by editing it in the GUI, which writes the user layer instead).
 - insert:
     - id: dsh-memory
       name: 'dsh-memory'
-      # Row config: the loader passes only this `config:` object to
-      # apply(ctx, config). Last-resort auxiliary LLM route for capture/Dream
-      # passes. Resolution per field, first non-empty wins: memory.llm.*
-      # settings → the current session's default model (agent-default-model)
-      # → this row.
-      config:
-        llm:
-          provider: deepseek
-          model: deepseek-v4-flash

@@ -3,19 +3,22 @@
  * memory (settings) is a clear error, a policy block is a structured result
  * (never a thrown secret), and every store mutation is audited.
  *
- *   memory_remember — store one durable memory (optionally correcting an older one)
- *   memory_recall   — ranked search with scope/kind/tag/time filters
- *   memory_get      — read one card in full (id, body, links, history pointers)
- *   memory_update   — write a corrected version that supersedes the old card
- *   memory_forget   — archive (default) or hard-delete; query mode is dry-run first
- *   memory_status   — store counts, kind/tag shape, inbox, last Dream run
- *   memory_dream    — trigger background consolidation
+ *   memory_remember    — store one durable memory (optionally correcting an older one)
+ *   memory_recall      — ranked search with scope/kind/tag/time filters
+ *   memory_get         — read one card in full (id, body, links, history pointers)
+ *   memory_update      — write a corrected version that supersedes the old card
+ *   memory_forget      — archive (default) or hard-delete; query mode is dry-run first
+ *   memory_gc          — capacity cleanup (dry run by default)
+ *   memory_drop_store  — permanently delete ONE project store (dry-run first)
+ *   memory_status      — store counts, kind/tag shape, inbox, last Dream run
+ *   memory_dream       — trigger background consolidation
  */
 import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import type { StoreLogger } from './store.ts';
 import type { MemoryCore } from './core.ts';
+import { maintenanceLimitsFrom } from './maintain.ts';
 import { MemoryPolicyError } from './types.ts';
 import type { MemorySettings } from './settings.ts';
 import type { DreamEngine } from './dream.ts';
@@ -139,6 +142,7 @@ export function registerMemoryTools(
             title: out.card.title,
             blocked: false,
             reason: '',
+            ...(out.note !== undefined ? { note: out.note } : {}),
             ...(out.card.supersedes.length > 0 ? { superseded: out.card.supersedes } : {}),
             ...(out.card.validUntil !== null ? { validUntil: out.card.validUntil } : {}),
             ...(out.warnings.length > 0 ? { piiWarnings: out.warnings } : {}),
@@ -454,6 +458,128 @@ export function registerMemoryTools(
     }),
   );
 
+  // ── memory_gc ────────────────────────────────────────────────────────────
+  tools.register(
+    defineTool({
+      name: 'memory_gc',
+      description:
+        'Capacity cleanup (GC) for memory stores: archive stale low-importance cards, enforce the live-card ceiling, prune the oldest archived cards and the audit/access logs, and compact the consumed capture inbox. DRY RUN by default — it reports exactly what would be removed; pass confirm=true to apply. Card sweeps ARCHIVE (restorable from the archive); the archive/log prunes are irreversible. Use when memory has grown large or a store feels slow.',
+      parameters: {
+        store: { type: 'string', description: 'Store slug to clean (default: every known store)' },
+        confirm: { type: 'boolean', description: 'true → apply the cleanup (default false = dry-run report)' },
+        staleDays: { type: 'integer', description: 'Override: archive cards untouched for this many days at low importance (0 disables; default from settings)' },
+        maxLiveCards: { type: 'integer', description: 'Override: live-card ceiling per store (default from settings)' },
+        maxArchivedCards: { type: 'integer', description: 'Override: archived-card ceiling; the oldest are hard-deleted past it' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            dryRun: { type: 'boolean' },
+            totals: { type: 'object', additionalProperties: true },
+            stores: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          },
+          additionalProperties: true,
+        },
+        render: jsonRender,
+      },
+      async execute(args: unknown) {
+        const st = getSettings();
+        if (!st.enabled) throw disabledError();
+        const a = (args ?? {}) as { store?: unknown; confirm?: unknown; staleDays?: unknown; maxLiveCards?: unknown; maxArchivedCards?: unknown };
+        const limits = maintenanceLimitsFrom(st);
+        if (typeof a.staleDays === 'number' && Number.isFinite(a.staleDays)) {
+          limits.staleDays = Math.max(0, Math.round(a.staleDays));
+        }
+        if (typeof a.maxLiveCards === 'number' && Number.isFinite(a.maxLiveCards)) {
+          limits.maxLiveCards = Math.max(1, Math.round(a.maxLiveCards));
+        }
+        if (typeof a.maxArchivedCards === 'number' && Number.isFinite(a.maxArchivedCards)) {
+          limits.maxArchivedCards = Math.max(0, Math.round(a.maxArchivedCards));
+        }
+        const slug = typeof a.store === 'string' && a.store.trim() !== '' ? a.store.trim() : null;
+        const report = await core.maintain({
+          limits,
+          slugs: slug !== null ? [slug] : undefined,
+          dryRun: a.confirm !== true,
+        });
+        return {
+          dryRun: report.dryRun,
+          totals: report.totals,
+          stores: report.stores.map((s) => ({
+            slug: s.slug,
+            kind: s.kind,
+            liveCards: s.liveCards,
+            staleArchived: s.staleArchived,
+            budgetArchived: s.budgetArchived,
+            archivePruned: s.archivePruned,
+            auditPruned: s.auditPruned,
+            accessPruned: s.accessPruned,
+            inboxDropped: s.inboxDropped,
+            bytesReclaimed: s.bytesReclaimed,
+            truncated: s.truncated,
+          })),
+          ...(report.dryRun ? { note: 'dry run — re-issue with confirm=true to apply' } : {}),
+        };
+      },
+    }),
+  );
+
+  // ── memory_drop_store ────────────────────────────────────────────────────
+  tools.register(
+    defineTool({
+      name: 'memory_drop_store',
+      description:
+        'Permanently delete ONE project memory store: every card, archive, Dream history, inbox and index, plus its projects.json entry. The global store can never be dropped. Without confirm=true this is a DRY RUN returning the counts that would be deleted. Use only when the user asks to erase a (deleted) project\'s memory.',
+      parameters: {
+        slug: { type: 'string', required: true, description: 'The project store slug to delete (see memory_status)' },
+        confirm: { type: 'boolean', description: 'true → actually delete (default false = dry run)' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            slug: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            liveCards: { type: 'number' },
+            archivedCards: { type: 'number' },
+            registryRemoved: { type: 'boolean' },
+            error: { type: 'string' },
+          },
+          additionalProperties: true,
+        },
+        render: jsonRender,
+      },
+      async execute(args: unknown, exec: unknown) {
+        const st = getSettings();
+        if (!st.enabled) throw disabledError();
+        const a = (args ?? {}) as { slug?: unknown; confirm?: unknown };
+        const slug = typeof a.slug === 'string' ? a.slug.trim() : '';
+        const base = { slug, dryRun: false, liveCards: 0, archivedCards: 0, registryRemoved: false };
+        if (slug === '') return { ...base, error: 'slug is required' };
+        if (slug === 'global') return { ...base, error: 'the global store cannot be dropped' };
+        if (a.confirm !== true) {
+          const store = core.storeBySlug(slug);
+          if (store === null) return { ...base, dryRun: true, error: `unknown memory store: ${slug}` };
+          const stats = await store.stats().catch(() => null);
+          return {
+            ...base,
+            dryRun: true,
+            liveCards: stats?.cards ?? 0,
+            archivedCards: stats?.archived ?? 0,
+            error: 'dry run — re-issue with confirm=true to delete',
+          };
+        }
+        try {
+          const res = await core.dropStore(slug, 'tool', sessionIdOf(exec));
+          return { ...base, slug: res.slug, liveCards: res.liveCards, archivedCards: res.archivedCards, registryRemoved: res.registryRemoved, error: '' };
+        } catch (err) {
+          return { ...base, error: err instanceof Error ? err.message : String(err) };
+        }
+      },
+    }),
+  );
+
   // ── memory_dream ─────────────────────────────────────────────────────────
   tools.register(
     defineTool({
@@ -524,6 +650,7 @@ export function registerMemoryTools(
               superseded: s.superseded,
               blocked: s.blocked,
               relinked: s.relinked,
+              pruned: s.pruned,
               error: s.error ?? '',
             })),
           };

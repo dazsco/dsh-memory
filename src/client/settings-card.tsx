@@ -1,18 +1,19 @@
 /**
- * The dsh-memory settings card: edits the `memory` namespace (a nested
- * section — capture/dream/brief/llm/redact) as the `memory` tab of the
- * Plugins settings section (`settings.plugins.tab`).
+ * The dsh-memory settings card: edits this plugin's live Config entry — the
+ * nested `dsh-memory` namespace (capture/dream/brief/llm/redact) — on the
+ * Plugins page, where the bundle and row configuration slots
+ * (`plugins.bundle.config`, `plugins.row.config`) seat a plugin's own form.
  *
- * Self-contained card chrome (disclosure header, staged fields grouped by
- * section, save/discard footer) following the plugin-card store pattern of
- * the DSH plugin configuration section; styles live in `styles.ts` and use
- * the DSH design tokens so the card follows the active theme. Plus a
- * "Dream now" trigger that bumps `dream.requestSeq` — the Host's existing
- * watcher fires a Dream run without any save.
+ * Self-contained card chrome (staged fields grouped by section, save/discard
+ * footer) following the plugin-card store pattern of the DSH configuration
+ * surface; styles live in `styles.ts` and use the DSH design tokens so the
+ * card follows the active theme. Plus a "Dream now" trigger that bumps
+ * `dream.requestSeq` — the Host's existing watcher fires a Dream run without
+ * any save.
  */
 import { useRef, useState, type ReactNode } from 'react';
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store';
-import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client';
+import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client';
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
 import type { MemorySettings } from '../settings.ts';
 import type { SettingsCardKey } from './locales.ts';
@@ -43,6 +44,8 @@ export interface MemorySettingsCardState extends CardShell {
   captureCompaction: CardFieldState;
   captureCompactionMaxChars: CardFieldState;
   captureHeuristic: CardFieldState;
+  captureLlmMaxCalls: CardFieldState;
+  captureLlmMinInterval: CardFieldState;
   dreamEnabled: CardFieldState;
   dreamUseLlm: CardFieldState;
   dreamInterval: CardFieldState;
@@ -57,6 +60,16 @@ export interface MemorySettingsCardState extends CardShell {
   recallLinkDecay: CardFieldState;
   recallBriefIncludeSuperseded: CardFieldState;
   commandsEnabled: CardFieldState;
+  budgetMaxCardBytes: CardFieldState;
+  budgetMaxInboxLines: CardFieldState;
+  maintenanceEnabled: CardFieldState;
+  maintenanceStaleDays: CardFieldState;
+  maintenanceStaleMaxImportance: CardFieldState;
+  maintenanceMaxLiveCards: CardFieldState;
+  maintenanceMaxArchivedCards: CardFieldState;
+  maintenanceMaxAuditLines: CardFieldState;
+  maintenanceMaxAccessLines: CardFieldState;
+  maintenanceMaxInboxBytes: CardFieldState;
   llmProvider: CardFieldState;
   llmModel: CardFieldState;
   llmMaxOutputTokens: CardFieldState;
@@ -76,15 +89,15 @@ export interface MemorySettingsCardFace extends CardActions {
   dreamNow: () => Promise<void>;
 }
 
-/** Bridges the `memory` scope onto the card's staged form. */
+/** Bridges the live `dsh-memory` configuration entry onto the card's staged form. */
 export class MemorySettingsCardController {
   private readonly form: CardForm<MemorySettings>;
   private readonly store: SnapshotStore<MemorySettingsCardState>;
 
   /**
-   * @param scope - the bound settings scope for the `memory` namespace.
+   * @param scope - the shared configuration form for this plugin's entry.
    */
-  constructor(private readonly scope: SettingsScope<MemorySettings>) {
+  constructor(private readonly scope: ConfigForm<MemorySettings>) {
     this.form = new CardForm<MemorySettings>(scope, [
       booleanField(['enabled']),
       selectField(['capture', 'mode'], ['off', 'explicit', 'auto']),
@@ -94,6 +107,8 @@ export class MemorySettingsCardController {
       booleanField(['capture', 'compaction']),
       numberField(['capture', 'compactionMaxChars'], 200),
       booleanField(['capture', 'heuristic']),
+      numberField(['capture', 'llmMaxCallsPerSession'], 0),
+      numberField(['capture', 'llmMinIntervalMs'], 0),
       booleanField(['dream', 'enabled']),
       booleanField(['dream', 'useLlm']),
       numberField(['dream', 'intervalMinutes'], 5),
@@ -108,6 +123,16 @@ export class MemorySettingsCardController {
       ratioField(['recall', 'linkDecay'], 0, 1),
       booleanField(['recall', 'briefIncludeSuperseded']),
       booleanField(['commands', 'enabled']),
+      numberField(['budget', 'maxCardBytes'], 256),
+      numberField(['budget', 'maxInboxLines'], 10),
+      booleanField(['maintenance', 'enabled']),
+      numberField(['maintenance', 'staleDays'], 0),
+      numberField(['maintenance', 'staleMaxImportance'], 1),
+      numberField(['maintenance', 'maxLiveCards'], 50),
+      numberField(['maintenance', 'maxArchivedCards'], 0),
+      numberField(['maintenance', 'maxAuditLines'], 100),
+      numberField(['maintenance', 'maxAccessLines'], 100),
+      numberField(['maintenance', 'maxInboxBytes'], 10000),
       textField(['llm', 'provider']),
       textField(['llm', 'model']),
       numberField(['llm', 'maxOutputTokens'], 16),
@@ -129,6 +154,8 @@ export class MemorySettingsCardController {
       captureCompaction: this.form.field('capture.compaction'),
       captureCompactionMaxChars: this.form.field('capture.compactionMaxChars'),
       captureHeuristic: this.form.field('capture.heuristic'),
+      captureLlmMaxCalls: this.form.field('capture.llmMaxCallsPerSession'),
+      captureLlmMinInterval: this.form.field('capture.llmMinIntervalMs'),
       dreamEnabled: this.form.field('dream.enabled'),
       dreamUseLlm: this.form.field('dream.useLlm'),
       dreamInterval: this.form.field('dream.intervalMinutes'),
@@ -143,6 +170,16 @@ export class MemorySettingsCardController {
       recallLinkDecay: this.form.field('recall.linkDecay'),
       recallBriefIncludeSuperseded: this.form.field('recall.briefIncludeSuperseded'),
       commandsEnabled: this.form.field('commands.enabled'),
+      budgetMaxCardBytes: this.form.field('budget.maxCardBytes'),
+      budgetMaxInboxLines: this.form.field('budget.maxInboxLines'),
+      maintenanceEnabled: this.form.field('maintenance.enabled'),
+      maintenanceStaleDays: this.form.field('maintenance.staleDays'),
+      maintenanceStaleMaxImportance: this.form.field('maintenance.staleMaxImportance'),
+      maintenanceMaxLiveCards: this.form.field('maintenance.maxLiveCards'),
+      maintenanceMaxArchivedCards: this.form.field('maintenance.maxArchivedCards'),
+      maintenanceMaxAuditLines: this.form.field('maintenance.maxAuditLines'),
+      maintenanceMaxAccessLines: this.form.field('maintenance.maxAccessLines'),
+      maintenanceMaxInboxBytes: this.form.field('maintenance.maxInboxBytes'),
       llmProvider: this.form.field('llm.provider'),
       llmModel: this.form.field('llm.model'),
       llmMaxOutputTokens: this.form.field('llm.maxOutputTokens'),
@@ -164,76 +201,65 @@ export class MemorySettingsCardController {
         const seq = this.projection().dreamSeq;
         return this.scope
           .mutate([{ op: 'set', path: ['dream', 'requestSeq'], value: seq + 1 }])
-          .then(() => undefined) as Promise<void>;
+          .then((accepted) => {
+            // A refused write or an unreachable Host is not a triggered run.
+            if (!accepted) throw new Error('dsh-memory: the Host refused the Dream trigger');
+          });
       },
     };
   }
+
+  /** Release the card's subscription to the shared configuration form. */
+  dispose(): void {
+    this.form.dispose();
+  }
 }
 
-/** Props the renderer binds for the dsh-memory Plugins-section tab. */
+/** Props the Plugins page binds for the dsh-memory configuration entry. */
 export type MemorySettingsCardProps =
-  PropsRuntime<'settings.plugins.tab'> & PropsLocale<'dsh-memory'> & InjectFace<MemorySettingsCardFace>;
+  PropsRuntime<'plugins.row.config'> & PropsLocale<'dsh-memory'> & InjectFace<MemorySettingsCardFace>;
 
-/** Card chrome: a disclosure header naming the plugin and what its settings govern, the controls, and the save that writes them. */
-function SettingsCard(props: {
+/**
+ * Card body: the read-only notice, the controls, and the save that writes
+ * them. The hosting page draws the plugin title and one-liner, so this card
+ * contributes no second header of its own.
+ */
+function SettingsCardBody(props: {
   t: (key: SettingsCardKey) => string;
-  titleKey: SettingsCardKey;
-  descriptionKey: SettingsCardKey;
   state: CardShell;
   onSave: () => void;
   onDiscard: () => void;
   children: ReactNode;
 }) {
-  const [open, setOpen] = useState(false);
   const { state } = props;
-  if (!state.available) return null;
-  const title = props.t(props.titleKey);
+  if (!state.available) {
+    return <p className="dshMemUnavailable" role="status">{props.t('chrome.unavailable')}</p>;
+  }
   const blocked = !state.dirty || state.invalid || state.saving;
   return (
-    <section className={open ? 'dshMemCard dshMemCardOpen' : 'dshMemCard'}>
-      <button
-        type="button"
-        className="dshMemHeader"
-        aria-expanded={open}
-        aria-label={`${props.t(open ? 'chrome.collapse' : 'chrome.expand')}: ${title}`}
-        title={props.t(props.descriptionKey)}
-        onClick={() => setOpen(!open)}
-      >
-        <span className="dshMemHeadText">
-          <span className="dshMemName">{title}</span>
-          <span className="dshMemDescription">{props.t(props.descriptionKey)}</span>
-        </span>
-        {state.dirty ? (
-          <span className="dshMemPending" title={props.t('chrome.unsaved')}>
-            {props.t('chrome.unsaved')}
-          </span>
+    <section className="dshMemCard dshMemCardOpen">
+      <div className="dshMemBody">
+        {!state.writable ? (
+          <p className="dshMemReadOnly" role="status">{props.t('chrome.readOnly')}</p>
         ) : null}
-        <span className={open ? 'dshMemChevron dshMemChevronOpen' : 'dshMemChevron'}>▾</span>
-      </button>
-      {open ? (
-        <div className="dshMemBody">
-          {!state.writable ? (
-            <p className="dshMemReadOnly" role="status">{props.t('chrome.readOnly')}</p>
+        {props.children}
+        <div className="dshMemFooter">
+          {state.failed ? (
+            <p className="dshMemFailed" role="status">{props.t('chrome.saveFailed')}</p>
           ) : null}
-          {props.children}
-          <div className="dshMemFooter">
-            {state.failed ? (
-              <p className="dshMemFailed" role="status">{props.t('chrome.saveFailed')}</p>
-            ) : null}
-            <button
-              type="button"
-              className="dshMemDiscard"
-              disabled={!state.dirty || state.saving}
-              onClick={props.onDiscard}
-            >
-              {props.t('chrome.discard')}
-            </button>
-            <button type="button" className="dshMemSave" disabled={blocked} onClick={props.onSave}>
-              {props.t(!state.saving ? 'chrome.save' : 'chrome.saving')}
-            </button>
-          </div>
+          <button
+            type="button"
+            className="dshMemDiscard"
+            disabled={!state.dirty || state.saving}
+            onClick={props.onDiscard}
+          >
+            {props.t('chrome.discard')}
+          </button>
+          <button type="button" className="dshMemSave" disabled={blocked} onClick={props.onSave}>
+            {props.t(!state.saving ? 'chrome.save' : 'chrome.saving')}
+          </button>
         </div>
-      ) : null}
+      </div>
     </section>
   );
 }
@@ -349,9 +375,10 @@ type DreamPhase = 'idle' | 'pending' | 'ok' | 'error';
 const DREAM_PHASE_RESET_MS = 3000;
 
 /**
- * Render the dsh-memory card.
- * @param props - locale copy, the card snapshot, and its form actions.
- * @returns the card.
+ * Render the dsh-memory configuration entry.
+ * @param props - the view the page asked for, locale copy, the card snapshot,
+ * and its form actions.
+ * @returns the one-liner for a summary view, or the settings form.
  */
 export function MemorySettingsCard(props: MemorySettingsCardProps) {
   const { t } = props;
@@ -378,11 +405,11 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
     'dshMemDreamNow' +
     (dreamPhase === 'ok' ? ' dshMemDreamNowOk' : '') +
     (dreamPhase === 'error' ? ' dshMemDreamNowError' : '');
+  // The row page asks for a one-liner first; only the page view draws controls.
+  if (props.view === 'summary') return t('card.description');
   return (
-    <SettingsCard
+    <SettingsCardBody
       t={t}
-      titleKey="card.title"
-      descriptionKey="card.description"
       state={state}
       onSave={props.save}
       onDiscard={props.discard}
@@ -469,6 +496,26 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
           {...state.captureHeuristic}
           onEdit={(text) => props.edit('capture.heuristic', text)}
           onReset={() => props.resetField('capture.heuristic')}
+        />
+        <ValueField
+          id="memory-capture-llm-max-calls"
+          label={t('field.captureLlmMaxCalls')}
+          hint={t('field.captureLlmMaxCallsHint')}
+          numeric
+          {...shared}
+          {...state.captureLlmMaxCalls}
+          onEdit={(text) => props.edit('capture.llmMaxCallsPerSession', text)}
+          onReset={() => props.resetField('capture.llmMaxCallsPerSession')}
+        />
+        <ValueField
+          id="memory-capture-llm-min-interval"
+          label={t('field.captureLlmMinInterval')}
+          hint={t('field.captureLlmMinIntervalHint')}
+          numeric
+          {...shared}
+          {...state.captureLlmMinInterval}
+          onEdit={(text) => props.edit('capture.llmMinIntervalMs', text)}
+          onReset={() => props.resetField('capture.llmMinIntervalMs')}
         />
       </Group>
       <Group t={t} titleKey="group.dream">
@@ -622,6 +669,109 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
           onReset={() => props.resetField('recall.briefIncludeSuperseded')}
         />
       </Group>
+      <Group t={t} titleKey="group.budget">
+        <ValueField
+          id="memory-budget-max-card-bytes"
+          label={t('field.budgetMaxCardBytes')}
+          hint={t('field.budgetMaxCardBytesHint')}
+          numeric
+          {...shared}
+          {...state.budgetMaxCardBytes}
+          onEdit={(text) => props.edit('budget.maxCardBytes', text)}
+          onReset={() => props.resetField('budget.maxCardBytes')}
+        />
+        <ValueField
+          id="memory-budget-max-inbox-lines"
+          label={t('field.budgetMaxInboxLines')}
+          hint={t('field.budgetMaxInboxLinesHint')}
+          numeric
+          {...shared}
+          {...state.budgetMaxInboxLines}
+          onEdit={(text) => props.edit('budget.maxInboxLines', text)}
+          onReset={() => props.resetField('budget.maxInboxLines')}
+        />
+      </Group>
+      <Group t={t} titleKey="group.maintenance">
+        <BooleanField
+          id="memory-maintenance-enabled"
+          label={t('field.maintenanceEnabled')}
+          hint={t('field.maintenanceEnabledHint')}
+          {...shared}
+          {...state.maintenanceEnabled}
+          onEdit={(text) => props.edit('maintenance.enabled', text)}
+          onReset={() => props.resetField('maintenance.enabled')}
+        />
+        <ValueField
+          id="memory-maintenance-stale-days"
+          label={t('field.maintenanceStaleDays')}
+          hint={t('field.maintenanceStaleDaysHint')}
+          numeric
+          {...shared}
+          {...state.maintenanceStaleDays}
+          onEdit={(text) => props.edit('maintenance.staleDays', text)}
+          onReset={() => props.resetField('maintenance.staleDays')}
+        />
+        <ValueField
+          id="memory-maintenance-stale-max-importance"
+          label={t('field.maintenanceStaleMaxImportance')}
+          hint={t('field.maintenanceStaleMaxImportanceHint')}
+          numeric
+          {...shared}
+          {...state.maintenanceStaleMaxImportance}
+          onEdit={(text) => props.edit('maintenance.staleMaxImportance', text)}
+          onReset={() => props.resetField('maintenance.staleMaxImportance')}
+        />
+        <ValueField
+          id="memory-maintenance-max-live-cards"
+          label={t('field.maintenanceMaxLiveCards')}
+          hint={t('field.maintenanceMaxLiveCardsHint')}
+          numeric
+          {...shared}
+          {...state.maintenanceMaxLiveCards}
+          onEdit={(text) => props.edit('maintenance.maxLiveCards', text)}
+          onReset={() => props.resetField('maintenance.maxLiveCards')}
+        />
+        <ValueField
+          id="memory-maintenance-max-archived-cards"
+          label={t('field.maintenanceMaxArchivedCards')}
+          hint={t('field.maintenanceMaxArchivedCardsHint')}
+          numeric
+          {...shared}
+          {...state.maintenanceMaxArchivedCards}
+          onEdit={(text) => props.edit('maintenance.maxArchivedCards', text)}
+          onReset={() => props.resetField('maintenance.maxArchivedCards')}
+        />
+        <ValueField
+          id="memory-maintenance-max-audit-lines"
+          label={t('field.maintenanceMaxAuditLines')}
+          hint={t('field.maintenanceMaxAuditLinesHint')}
+          numeric
+          {...shared}
+          {...state.maintenanceMaxAuditLines}
+          onEdit={(text) => props.edit('maintenance.maxAuditLines', text)}
+          onReset={() => props.resetField('maintenance.maxAuditLines')}
+        />
+        <ValueField
+          id="memory-maintenance-max-access-lines"
+          label={t('field.maintenanceMaxAccessLines')}
+          hint={t('field.maintenanceMaxAccessLinesHint')}
+          numeric
+          {...shared}
+          {...state.maintenanceMaxAccessLines}
+          onEdit={(text) => props.edit('maintenance.maxAccessLines', text)}
+          onReset={() => props.resetField('maintenance.maxAccessLines')}
+        />
+        <ValueField
+          id="memory-maintenance-max-inbox-bytes"
+          label={t('field.maintenanceMaxInboxBytes')}
+          hint={t('field.maintenanceMaxInboxBytesHint')}
+          numeric
+          {...shared}
+          {...state.maintenanceMaxInboxBytes}
+          onEdit={(text) => props.edit('maintenance.maxInboxBytes', text)}
+          onReset={() => props.resetField('maintenance.maxInboxBytes')}
+        />
+      </Group>
       <Group t={t} titleKey="group.commands">
         <BooleanField
           id="memory-commands-enabled"
@@ -689,6 +839,6 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
           onReset={() => props.resetField('redact.pii')}
         />
       </Group>
-    </SettingsCard>
+    </SettingsCardBody>
   );
 }

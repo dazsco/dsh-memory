@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory",
   "description": "DSH-native memory plugin: global + per-project memory, AGENTS.md rules, background Dream consolidation, a /memory composer command, and a GUI management surface",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -19,6 +19,7 @@
   "files": [
     "lib",
     "src",
+    "docs",
     "cordis.patch.yml",
     "tsconfig.json",
     "tsconfig.build.json",
@@ -35,7 +36,7 @@
       "inject": [
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
         "@deepseek-ai/dsh-client-ui-renderer"
       ]
     }
@@ -45,6 +46,8 @@
     "watch": "node build.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test": "node --test \"tests/**/*.test.mjs\"",
+    "test:scale": "node --test \"tests/**/*.slow.mjs\"",
+    "bench": "node scripts/bench.mjs",
     "prepack": "npm run build"
   },
   "keywords": [
@@ -79,9 +82,9 @@
     "@deepseek-ai/cordis": "link:D:/Repos/deepseek-harness/vendor/cordis",
     "@deepseek-ai/dsh-client-locale": "link:D:/Repos/deepseek-harness/packages/client/locale",
     "@deepseek-ai/dsh-client-store": "link:D:/Repos/deepseek-harness/packages/client/store",
+    "@deepseek-ai/dsh-client-ui-plugin-manager": "link:D:/Repos/deepseek-harness/packages/client/ui-plugin-manager",
     "@deepseek-ai/dsh-client-ui-renderer": "link:D:/Repos/deepseek-harness/packages/client/ui-renderer",
     "@deepseek-ai/dsh-client-ui-settings": "link:D:/Repos/deepseek-harness/packages/client/ui-settings",
-    "@deepseek-ai/dsh-client-ui-settings-plugins": "link:D:/Repos/deepseek-harness/packages/client/ui-settings-plugins",
     "@deepseek-ai/dsh-client-ui-slots": "link:D:/Repos/deepseek-harness/packages/client/ui-slots",
     "@deepseek-ai/schemastery": "link:D:/Repos/deepseek-harness/vendor/schemastery",
     "@types/node": "^24.0.0",

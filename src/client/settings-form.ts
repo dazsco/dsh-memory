@@ -1,20 +1,20 @@
 /**
  * Staged form model behind the dsh-memory settings card — the plugin-card
- * store pattern of the DSH plugin-configuration section, adapted for a NESTED
+ * store pattern of the DSH plugin-configuration surface, adapted for a NESTED
  * settings section: every field is addressed by a path (e.g. `['capture',
- * 'useLlm']`) and writes go through the bound settings scope's `mutate` with
- * path ops, so the user layer stays minimal (a field is stored only while the
- * user actually overrides it).
+ * 'useLlm']`) and writes go through the bound configuration form's `mutate`
+ * with path ops, so the user layer stays minimal (a field is stored only while
+ * the user actually overrides it).
  *
  * A card stages what the user types and writes it only when they save. Each
- * settings write is a durable, revision-fenced document mutation, so staging
+ * settings write is a durable, revision-fenced profile mutation, so staging
  * keeps what is on screen exactly what a save would store. A field shows its
  * effective value — user layer over composition layer over schema default —
  * and whether the user layer carries it (presence, not value equality, marks
  * an override).
  */
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store';
-import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client';
+import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client';
 
 /** Structural twin of dsh-settings' JsonValue (field parses only yield JSON-safe scalars). */
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -192,19 +192,30 @@ export class CardForm<T> {
   private readonly specs: Map<string, CardFieldSpec>;
   private readonly staged = new Map<string, StagedEdit>();
   private readonly listeners = new Set<() => void>();
+  private readonly unsubscribe: () => void;
   private saving = false;
   private failed = false;
 
   /**
-   * @param scope - the bound settings scope for this card's namespace.
+   * @param scope - the shared configuration form for this card's entry.
    * @param specs - the section fields this card edits.
    */
   constructor(
-    private readonly scope: SettingsScope<T>,
+    private readonly scope: ConfigForm<T>,
     specs: CardFieldSpec[],
   ) {
     this.specs = new Map(specs.map((spec) => [keyOf(spec.path), spec]));
-    this.scope.subscribe(() => this.publish());
+    this.unsubscribe = this.scope.subscribe(() => this.publish());
+  }
+
+  /**
+   * Release the form's subscription to the shared configuration form. The card
+   * owns this lifetime: a client reload (HMR) would otherwise leave one
+   * listener per generation behind.
+   */
+  dispose(): void {
+    this.unsubscribe();
+    this.listeners.clear();
   }
 
   /** Publish a projection of this form, rebuilt whenever the scope or a draft changes. */
@@ -315,22 +326,23 @@ export class CardForm<T> {
   }
 
   private async clear(path: readonly string[]): Promise<boolean> {
-    await this.mutate({ op: 'unset', path });
-    return !this.pathInUser(path);
+    const accepted = await this.mutate({ op: 'unset', path });
+    return accepted && !this.pathInUser(path);
   }
 
   private async store(path: readonly string[], value: unknown): Promise<boolean> {
-    await this.mutate({ op: 'set', path, value });
+    const accepted = await this.mutate({ op: 'set', path, value });
+    if (!accepted) return false;
     const user = this.scope.getSnapshot().user;
     return pathHas(user, path) && pathValue(user, path) === value;
   }
 
-  private async mutate(op: { op: 'set'; path: readonly string[]; value: unknown } | { op: 'unset'; path: readonly string[] }): Promise<void> {
+  private async mutate(op: { op: 'set'; path: readonly string[]; value: unknown } | { op: 'unset'; path: readonly string[] }): Promise<boolean> {
     const revision = this.scope.getSnapshot().revision;
-    await this.scope.mutate(
+    return await this.scope.mutate(
       [
         op.op === 'set'
-          // Field parses only yield JSON-safe scalars; the scope's path-op
+          // Field parses only yield JSON-safe scalars; the form's path-op
           // view types the value as JsonValue (structurally the same).
           ? { op: 'set' as const, path: [...op.path], value: op.value as JsonValue }
           : { op: 'unset' as const, path: [...op.path] },

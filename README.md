@@ -36,8 +36,8 @@ $DSH_HOME/memory/
 
 | DSH capability | Used for |
 | --- | --- |
-| `settings` service | the live-hot-reloadable `memory` namespace (GUI + settings document) |
-| `tools` service | 7 model-facing tools |
+| `settings` service | the live Config of this row (`dsh-memory` volatile fields; GUI + profile patch) |
+| `tools` service | 9 model-facing tools |
 | `commands` service | `/memory …` typed by the **human** in the composer (one command, Chinese subcommand aliases) |
 | `connection` service | 13 exact `/api/memory/*` fetch routes served to the browser through the connection's auth |
 | `timer` service | 60 s Dream tick + 30 s startup sweep (patched in whenever the service appears) |
@@ -121,7 +121,7 @@ The composition row can override the auxiliary LLM route:
     model: deepseek-v4-flash
 ```
 
-## Tools (7)
+## Tools (9)
 
 | Tool | Purpose |
 | --- | --- |
@@ -130,8 +130,10 @@ The composition row can override the auxiliary LLM route:
 | `memory_get` | Read one card in full by exact id (body, metadata, link graph, supersede pointers). |
 | `memory_update` | Write a corrected version of a card: the old one is kept on disk as history and stops being recalled (bitemporal supersede). Policy-gated like `memory_remember`. |
 | `memory_forget` | Archive (default, recoverable) or hard-delete by exact id. Forget-by-query is a **dry run** unless `confirm=true`, so nothing destructive is ever implied by a fuzzy match. |
+| `memory_gc` | Capacity cleanup: archive stale low-value cards, enforce the live-card ceiling, prune the oldest archived cards and the audit/access logs, compact the consumed inbox. **Dry run** unless `confirm=true`. |
+| `memory_drop_store` | Permanently delete ONE project store (cards, archive, Dream history, inbox, index + its registry entry). Dry run unless `confirm=true`; the global store can never be dropped. |
 | `memory_status` | Per-store card / archived / superseded counts, pending inbox, kind histogram, top tags, bytes, totals, last Dream run. Works when memory is disabled. |
-| `memory_dream` | Trigger background consolidation (ingest, dedup, decay, relink, conflict, reindex), or read its status. |
+| `memory_dream` | Trigger background consolidation (ingest, dedup, decay, relink, conflict, maintenance, reindex), or read its status. |
 
 ## Composer commands (DSH `commands`)
 
@@ -144,6 +146,7 @@ Typed by the human, executed on the Host without a model turn. **One command**, 
 /memory search <query>  | 搜索   recall across every known store
 /memory remember <text> | 写入   store a durable memory
 /memory forget <id>     | 遗忘   archive one memory (recoverable)
+/memory gc [confirm]    | 清理   capacity cleanup (dry run unless confirmed)
 /memory dream           | 整理   run one Dream consolidation now
 /memory help            | 帮助   usage
 ```
@@ -152,7 +155,9 @@ The policy gate covers the command path too: a blocked write returns `Blocked by
 
 No command icon: the composer menu takes a row's icon either from a client-side `CommandContribution` (`ui-commands`) or from the first-party `HOST_FACES` map, and a contribution may not share a name with a host command (the client throws `contribution /<name> collides with a host command`). An icon is therefore only reachable by moving `/memory` entirely to the client, which would lose typed subcommands, result text, and availability outside the Web client — not worth it.
 
-## Settings (namespace `memory`, GUI: Settings → Plugins → dsh-memory)
+## Settings (namespace `dsh-memory`, GUI: Plugins → dsh-memory → Configure)
+
+DSH 0.1.7 projects a plugin's own `Config` through `ctx.settings`, and the form namespace is the **Loader row id** — for this bundle that is `dsh-memory` (the package name). Every section below is declared `.volatile()`, so a save commits into the running row's references without remounting it; the profile patch (`$DSH_PROFILE_DIR/cordis.patch.yml`) is the user layer, this bundle's `cordis.patch.yml` is the composition layer, and the schema defaults below are the last layer. The same values are readable/writable from the settings document, so `dsh` CLI and GUI edits are the same write.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -160,6 +165,8 @@ No command icon: the composer menu takes a row's icon either from a client-side 
 | `capture.mode` | `auto` | `off` never / `explicit` explicit-only (no auto-capture at all) / `auto` turn-end extraction |
 | `capture.useLlm` | `true` | extraction uses the user LLM route |
 | `capture.heuristic` | `true` | rule-based intent extraction on user statements |
+| `capture.llmMaxCallsPerSession` | `20` | ceiling on auxiliary extraction calls per session (`0` = unlimited). The pass re-reads the conversation tail, so a skipped turn is covered by the next call |
+| `capture.llmMinIntervalMs` | `30000` | minimum spacing between two extraction calls in one session (`0` = none); collapses a fast back-and-forth into one call instead of one per turn |
 | `capture.turnTailChars` | `20000` | tail chars of a turn fed to extraction |
 | `capture.minTurnContentChars` | `120` | turns shorter than this are never captured |
 | `capture.compaction` | `true` | stage the harness's compaction summary as a `summary` candidate |
@@ -169,7 +176,7 @@ No command icon: the composer menu takes a row's icon either from a client-side 
 | `dream.useLlm` | `true` | LLM passes (summarize/conflict); off = heuristics only |
 | `dream.intervalMinutes` | `30` | idle-tick cadence (min 5) |
 | `dream.maxLlmCalls` / `maxWallMs` | `40` / `600000` | per-run LLM call budget / wall-clock budget |
-| `dream.requestSeq` | `0` | GUI "Dream now" monotonic trigger (legacy path; the page now POSTs `/api/memory/dream`) |
+| `dream.requestSeq` | `0` | GUI "Dream now" monotonic trigger: the form writes it and the row's `loader/volatile-update` listener fires the run (the Memory page prefers `POST /api/memory/dream` and falls back to this) |
 | `brief.enabled` / `maxBytes` | `true` / `4096` | session brief switch / injected byte cap |
 | `brief.projectK` / `globalK` | `12` / `8` | max project / global memories injected |
 | `recall.k` | `8` | default result count for `memory_recall` / `/memory recall` |
@@ -177,8 +184,27 @@ No command icon: the composer menu takes a row's icon either from a client-side 
 | `recall.briefIncludeSuperseded` | `false` | include superseded cards in the session brief |
 | `commands.enabled` | `true` | register `/memory` (the only command; subcommands cover the old `/remember`) |
 | `budget.maxCardBytes` / `maxInboxLines` | `4096` / `1000` | per-card byte cap / inbox line cap (Dream compacts the **consumed** head after each run; the unconsumed tail is never dropped) |
-| `llm.provider` / `model` | `''` | per-field override. Resolution order, first non-empty per field: ① this setting → ② the session's live default model (`agent-default-model` namespace, so the plugin rides the route the agent itself uses) → ③ the composition-row `llm:` route as last resort |
+| `maintenance.enabled` | `true` | run the capacity-maintenance pass at the end of every Dream run |
+| `maintenance.staleDays` / `staleMaxImportance` | `180` / `6` | archive a live card untouched this long when its importance is ≤ the ceiling (`staleDays: 0` disables; `preference`/`commitment` are exempt) |
+| `maintenance.maxLiveCards` | `2000` | live-card ceiling per store; past it the lowest-value cards are archived (standing kinds last) |
+| `maintenance.maxArchivedCards` | `2000` | archived-card ceiling per store; the **oldest** are hard-deleted past it |
+| `maintenance.maxAuditLines` / `maxAccessLines` | `4000` / `4000` | log line ceilings per store (newest lines are kept) |
+| `maintenance.maxInboxBytes` | `1000000` | inbox byte ceiling per store (the consumed head is dropped first) |
+| `llm.provider` / `model` | `''` | per-field override. Resolution order, first non-empty per field: ① this setting → ② the deployment's live default model (`ctx.agentDefaultModel.currentSelection()`, so the plugin rides the route the agent itself uses) → ③ this plugin's shipped fallback route (`deepseek` / `deepseek-v4-flash`). An empty setting inherits; the composition row may pin the route instead |
 | `llm.maxOutputTokens` / `timeoutMs` | `2000` / `60000` | per auxiliary call: output cap / deadline |
+
+## Capacity & cleanup
+
+Memory that only ever grows makes every recall, Dream run and index write slower, so the plugin is **bounded** rather than cumulative:
+
+- **Bounded hot paths.** Recall ranks a *capped* candidate pool and the greedy MMR loop stops after `k` picks (the old shape ranked the entire corpus on every call and was effectively cubic). Dream's dedup builds one token set per card instead of rebuilding them for every inbox entry; relinking is driven by a tag inverted index instead of an all-pairs scan; the conflict pass has a comparison ceiling. Every long pass yields to the event loop at most once per 8 ms, so a big consolidation never freezes the harness.
+- **Incremental index.** `index.json` is updated per card — with exact `docCount` / `avgDocLen` / `df` maintenance — instead of re-reading every card file on every write. It is written compact (not pretty-printed), and each card's persisted token array is capped.
+- **Automatic maintenance** (pass 6 of every Dream run, `maintenance.*`): stale low-importance cards are archived, the live-card ceiling is enforced by evicting the lowest-value cards, and the archive / audit / access / inbox budgets are pruned. The pass honours the run's wall-clock budget (a truncated sweep simply resumes next run) and every ceiling is editable in **Plugins → dsh-memory → Configure** (groups *Write budgets* and *Capacity & cleanup*).
+- **Bounded write bursts.** A fresh large store changes every card's links at once; the relink pass writes at most 500 cards per run (idempotent, so the remainder converges on later runs), and the auxiliary extraction call is throttled per session (`capture.llmMaxCallsPerSession` / `llmMinIntervalMs`) so a long session no longer fires one extra model call per turn.
+- **On demand**: the `memory_gc` tool and `/memory 清理 [slug] [confirm]`. Both are **dry runs** unless confirmed, and report exactly what would be archived, pruned and how many bytes that reclaims.
+- **Full reset**: delete `$DSH_HOME/memory/projects/<slug>` (or `$DSH_HOME/memory/global`) to erase that store by hand; `memory_drop_store` / `/memory 删除库 <slug>` does it for one project store and cleans up the registry entry too.
+
+Nothing is lost silently: card sweeps **archive** (the file moves to `archive/` and is restorable from Settings → Memory → Archive); only the archive/log prunes are irreversible, and only past their configured ceilings.
 
 ## Export & import
 
@@ -192,11 +218,15 @@ No command icon: the composer menu takes a row's icon either from a client-side 
 npm install
 npm run build      # esbuild: lib/index.js (host) + lib/testing.js + lib/client.js (GUI settings card + Memory page)
 npm run typecheck
-npm test           # node --test tests/**/*.test.mjs (138 tests)
+npm test           # fast suite (node --test tests/**/*.test.mjs)
+npm run test:scale # scale guards (tests/**/*.slow.mjs) — slow; run before shipping
+npm run bench      # measure recall / write / Dream cost; `-- 3000` and `--old` to compare shapes
 ```
 
-- `src/` is the host plane (store / core / capture / recall / dream / tools / commands / brief / settings / browse / llm); `src/client/` is the browser plane (the plugin settings tab in `settings.plugins.tab` + the Memory page in `settings.section`).
-- Every host contribution is registered inside the service scope it needs (`ctx.inject([...])`), so any mount order works, an absent optional service is one warning, and disposal unwinds with the fiber. The row config is validated by the exported `Config` schema at mount time.
+- `docs/PERFORMANCE.md` records the measured hot paths, the remaining linear shapes, the ceilings, and the design sketches (postings, sharded index, hub tags) that are deliberately **not** implemented yet — with the trigger conditions that would justify them.
+
+- `src/` is the host plane (store / core / capture / recall / dream / tools / commands / brief / settings / browse / llm); `src/client/` is the browser plane (the plugin's own configuration form in `plugins.bundle.config` + `plugins.row.config`, and the Memory page in `settings.section`).
+- Every host contribution is registered inside the service scope it needs (`ctx.inject([...])`), so any mount order works, an absent optional service is one warning, and disposal unwinds with the fiber. The row config is validated by the exported `Config` schema at mount time, and the settings form is derived from that same schema (`volatileForm`).
 - Recall, the brief, Dream and the GUI all score from the derived index (`index.json` v2 keeps each card's `terms`); no read path re-opens every card file. Rules files are cached behind their mtimes. `src/browse.ts` owns the route table (`MEMORY_BROWSE_ROUTES`), which is also what the tests assert against.
 - All LLM work goes through the injected `llm` service with hard deadlines; **no LLM failure is ever fatal** (a stalled stream is bounded by the per-call deadline and the single stream iterator is cancelled, never re-entered); tools return anonymous JSON-safe literals.
 - npm is the canonical package manager (`package-lock.json`); line endings are pinned to LF by `.gitattributes`.
@@ -205,7 +235,7 @@ npm test           # node --test tests/**/*.test.mjs (138 tests)
 
 - Row mounted: `dsh --profile web --dump-config` shows the `dsh-memory` row (with LLM route).
 - Client bundle: `GET /plugins/dsh-memory/client.js` → 200, full `__ModuleLoader__` envelope.
-- Settings surface: `settings.describe` returns the `memory` namespace with full defaults; nested-path `settings.mutate` set/unset verified in both directions.
+- Settings surface: `settings.describe` returns the `dsh-memory` namespace with full defaults; nested-path `settings.mutate` set/unset verified in both directions. (Superseded by the v0.5.0 record below, which uses the entry-id namespace.)
 - Tools: a real session's `memory_status` returned live data for both stores (global + auto-registered project store `D-Repos-tanke`).
 - Dream: `memory_dream` in the live process finished in 35 ms, wrote the `lastDream` checkpoint, idempotent.
 - Secret gate: a fake key was blocked (`blocked:true`) and never persisted.
@@ -242,3 +272,50 @@ Audit-driven fixes (see `docs/AUDIT.md`, findings F1–F17); no behavior outside
 - **Verification**: `npm run typecheck` clean; `npm run build` → lib/index.js + lib/testing.js + lib/client.js; `npm test` → **138/138** (118 baseline + 20 new v3 cases covering index migration, self-heal, supersede paths, filters, link expansion, export/import, dry-run forget, status shape, compaction capture, the command surface and the new routes; plus tool-boundary cases for `memory_get` / `memory_update` / filtered recall in the wiring E2E).
 - **Live acceptance (web profile, upgraded in place)**: the bundle installed and activated as `include:dsh-memory` (`fiberPhase: active`), recorded in the profile's `dsh.profile.bundles` and `dependencies` so it survives a restart, with zero activation warnings. The plugin's own tools then ran against the REAL store: `memory_status` reported the new shape (`schema: 2`, `totals`, and per-store `superseded`/`kinds`/`topTags`/`bytes`) across **7 stores / 441 cards**, i.e. the v1→v2 index migration completed silently on existing data; `memory_recall` with `scope:"all"` searched every store and the `minImportance`/`scope` filters composed; `memory_get` returned a full pre-v2 card with `supersededBy: null`, proving backward compatibility on real files.
 - **Environment note (not a plugin defect)**: this machine's sandbox silently swallows symbolic-link creation (`mklink /D` reports success, the link never appears; junctions work). pnpm therefore records the dependency but never materializes the top-level `node_modules` entry, so `plugin_manager install_bundle` fails resolution on the first attempt. Repair: create `…/profiles/web/node_modules/dsh-memory` as a **junction** to the repo, then re-run `plugin_manager install_bundle` — pnpm leaves the existing entry alone and activation proceeds. The Memory page and `/memory` command need a human in the browser/composer; this session had no browser control and every HTTP route is auth-gated (401), so those two surfaces are covered by the client bundle build + the host route/command tests, not by a click-through.
+
+## Acceptance record (v0.4.0 — capacity & performance hardening, 2026-09-25)
+
+**Problem**: memory only ever grew; once a project store reached hundreds-to-thousands of cards, dsh became visibly laggy.
+
+**Root causes** (all of it ran synchronously on the harness's own event loop):
+
+1. `rankWithMmr` ran a greedy MMR over the ENTIRE candidate set and only then did `slice(0, k)` — with the inner loop also walking the selected set, that is **O(N³)**, on every recall (and twice per session for the brief). Measured at 1000 cards: **130.8 s** for one ranking.
+2. Dream's relink pass compared every card against every other card AND built `new Set(tokens)` for every pair — O(N²) set constructions.
+3. Dream's dedup pass rebuilt every card's token set for EVERY inbox entry — O(entries × cards) set constructions.
+4. Every explicit write (`remember`/`update`/`forget`/`restore`) ran a full `rebuildIndex` (O(N) file reads + a multi-MB JSON serialization).
+5. Unbounded growth: no live-card ceiling (only `observation` decayed at 14 days), an audit log that was never trimmed, an access log cleared only by Dream, an inbox bounded by lines alone (each up to 20 KB), and an index carrying every card's `terms` and written **indented**.
+6. Whole-file reads on hot paths: `inboxLineCount` on every tick/status; `readAuditTail` parsed the entire audit log to show its last 50 rows.
+
+**Fixes**:
+
+- **Bounded recall**: the candidate pool is cut by score (≥240 or 12×k) and MMR stops after k picks → O(pool·k). At 3000 cards MMR is 12 ms and `core.recall` is 36–52 ms end-to-end, essentially independent of N.
+- **Bounded Dream**: one token set per card per run; relinking driven by a tag inverted index (same semantics: ≥2 shared tags, top 5 by shared count); the conflict pass gained a token-length prefilter and a 20 000-comparison ceiling; every long loop yields to the event loop at most once per 8 ms.
+- **Incremental index**: per-card updates with exact `docCount`/`totalTokens`/`df` maintenance, compact (non-indented) writes, a per-card `terms` cap of 1024, and an automatic full-rebuild fallback for an index written without `bm25.totalTokens`.
+- **Batching**: `patchCards` writes a whole batch under one lock; card file I/O runs 16-wide (3000-card rebuild 1.26 s → 0.48 s); recall counters are buffered in-process and flushed in batches (which also removed a floating promise racing store teardown).
+- **In-place index delta & batched sweeps**: the per-card index update no longer copies `cards`/`df` (that was O(cards + vocabulary) *per write* — it now costs O(changed card)); `archiveCards` + `auditMany` move a bulk sweep under one lock / one index update / one audit append per 256 cards, which cut the first Dream on an over-cap 3000-card store from 13.5 s to **6.5 s**.
+- **Bounded growth**: new `maintenance.*` ceilings enforced by Dream's pass 6; real tail reads and trimming for the audit/access logs; an inbox bounded by lines AND bytes; a ceiling on archived cards.
+- **Bounded write bursts & per-turn cost**: Dream's wall-clock budget now reaches the decay/relink/maintenance passes (a truncated pass resumes next run) and the relink write phase is capped at 500 cards per run; the auxiliary capture call is throttled per session (budget + minimum interval) instead of firing once per turn; the scoring corpus is cached per index object so recall no longer rebuilds a Map of every card; and the `budget.*` / `maintenance.*` knobs are now editable in the GUI settings card.
+- **Cleanup surfaces**: the `memory_gc` tool and `/memory 清理 [slug] [confirm]` (dry run by default, reporting per-store archivals, prunes and reclaimed bytes); card sweeps always ARCHIVE and stay restorable from the GUI archive tab.
+
+**Measured** (local Windows, N=1000): MMR 124 282 ms → **4 ms**; relink 5 179 ms → 330 ms (≈16×); one write 153 ms (full rebuild) → 34 ms (incremental). At N=3000 recall is 27–53 ms and a steady-state Dream is **2.9 s**. Full profile, the remaining linear shapes, and the deferred design sketches are in `docs/PERFORMANCE.md`.
+
+- **Breaking changes**: `StoreDreamResult` gained `pruned`; `StoreMaintenanceResult` gained `truncated`; `archiveCard`/`deleteCardHard`/`restoreCard` gained `opts.rebuild`; new `capture.llmMaxCallsPerSession`/`llmMinIntervalMs`, new `maintenance` settings section, new `memory_gc` tool, new `/memory 清理` subcommand; index schema stays 2 (new optional `bm25.totalTokens`).
+- **Verification**: `npm run typecheck` clean; `npm run build` → lib/index.js + lib/testing.js + lib/client.js; `npm test` → **162/162** fast cases (147 baseline + 15 new: maintenance policy, dry run vs apply, archive/log budgets, inbox drops only the consumed head — by line and by byte — a deadline-truncated sweep, incremental index deep-equals a full rebuild, legacy-index upgrade, `memory_gc`, `/memory 清理`, capture-call throttling by budget/interval/session) plus `npm run test:scale` → **3/3** scale guards. `npm run bench` reproduces every number above.
+
+## Acceptance record (v0.5.0 — DSH 0.1.7 adaptation, 2026-09-22)
+
+The harness moved from the standalone settings-namespace registry to **the plugin's own Config** (`describe`/`update`/`mutate` address a Loader entry, only `.volatile()` fields are editable, and edits commit into the running fiber), and it retired the shared `{kind:'plugin'}` message source in favour of producer-owned kinds. This release adapts to both.
+
+**Breaking changes**
+
+- The settings namespace is the **row id** `dsh-memory`, not `memory`; the plugin's whole configuration is now its exported `Config` schema (`MemorySettingsSchema`), one volatile field per section. There is no `settings.register`/`scope.get()` any more, and the composition row no longer carries an `llm:` route — an empty `llm.provider`/`model` inherits from `ctx.agentDefaultModel` and then from the plugin's shipped fallback.
+- Messages this plugin produces are attributed `{ kind: 'dsh-memory' }` (`form: 'recall'` for the session brief). The durable brief dedup still recognizes the two legacy spellings (`plugin:dsh-memory` as the session-format reader namespaces a released session, and a raw `{kind:'plugin', plugin:'dsh-memory'}`), so upgrading never re-briefs a resumed session.
+- Capture classifies human text by `source.kind === 'user'` — the only source that means "a person typed this" in the producer-owned vocabulary — instead of blacklisting `plugin`/`tool`.
+- The browser half registers the configuration form into the Plugins page's own seats (`plugins.bundle.config` keyed by package name and `plugins.row.config` keyed `dsh-memory#dsh-memory`) and reads it through `ctx.configForms.get('dsh-memory')`; the old `settings.plugins.tab` tab is gone. The card keeps its staged fields, its groups, and Save/Discard, and now renders inline (the page draws the title and one-liner) with a `view: 'summary'` one-liner for the row.
+
+**Verification**
+
+- `npm run typecheck` clean; `npm run build` → lib/index.js + lib/testing.js + lib/client.js; `npm test` → **173/173** fast cases (162 baseline, re-based onto the new fixtures: every genuine-user fixture now carries `{kind:'user'}`, the checkpoint marker case asserts the marker on a human-sourced message, and the wiring E2E drives a fake volatile Config; plus 7 settings-contract cases in `tests/v5.test.mjs` and 4 browser-half cases in `tests/client.test.mjs` that materialize the built bundle without a browser).
+- **Live acceptance (web profile, upgraded in place)**: `plugin_manager install_bundle link:D:/Repos/dsh/dsh-memory` → `application: applied`, and the composed row reports `Config.listConfigs` entry `include:dsh-memory` with `status: schema` and the projected form showing all ten sections `x-cordis.volatile: true`. The row's nine tools (`Tool.listTools`) and the browser registrations (`Slots.listSubTree` → `settings.section` occupant `memory`, `plugins.row.config` occupant `dsh-memory#dsh-memory`, both `active`) are live in the running Host and page.
+- **Live settings round-trip**: a composition-layer write into `$DSH_PROFILE_DIR/cordis.patch.yml` (`enabled: false`) flipped `memory_status` to `enabled:false` in the running process with no remount, and a `dream.requestSeq: 5` bump in the same config layer made the row's `loader/volatile-update` listener run Dream immediately (`lastDream` went from `""` to a real timestamp). The temporary override was removed afterwards, leaving the profile as found.
+- **Not click-verified**: this session has no browser control and the Web route is auth-gated (401), so the rendered card and the Memory page were verified through the live Client slot ledger and the client bundle build, not by clicking. `fiberPhase`/slot `active` state and the Host-side Config round-trip are the evidence.

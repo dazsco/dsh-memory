@@ -110,6 +110,13 @@ export interface CardMeta {
 export interface Bm25Stats {
   docCount: number;
   avgDocLen: number;
+  /**
+   * Sum of every indexed card's term count (avgDocLen = totalTokens/docCount).
+   * Persisted so an INCREMENTAL single-card index update keeps the average
+   * exact without re-reading the corpus. Absent in an index written before
+   * incremental updates existed — such an index is rebuilt on first write.
+   */
+  totalTokens?: number;
   /** Document frequency per token. */
   df: Record<string, number>;
 }
@@ -154,7 +161,11 @@ export type AuditOp =
   | /** A card replaced by a newer version (bitemporal supersede). */
   'supersede'
   | /** A card restored from an imported bundle (memory.export/import). */
-  'import';
+  'import'
+  | /** A whole project store directory was dropped (final line before rm). */
+  'drop-store'
+  | /** One maintenance/GC pass summary (what it archived and pruned). */
+  'maintain';
 
 export type AuditVia =
   | 'tool'
@@ -168,7 +179,9 @@ export type AuditVia =
   | 'user'
   | 'client'
   | 'command'
-  | 'system';
+  | 'system'
+  /** Capacity/GC pass (automatic Dream pass or an explicit memory_gc call). */
+  | 'maintenance';
 
 export interface AuditEntry {
   ts: string;
@@ -271,6 +284,53 @@ export interface StatusReport {
     superseded: number;
     pendingInbox: number;
     bytes: number;
+  };
+}
+
+/**
+ * What one maintenance (GC) pass did — or WOULD do on a dry run. Every field
+ * counts ACTIONS, not bytes, except `bytesReclaimed` which is the summed size
+ * of the files/lines removed.
+ */
+export interface StoreMaintenanceResult {
+  slug: string;
+  kind: 'global' | 'project';
+  dryRun: boolean;
+  /** Live cards before the pass. */
+  liveCards: number;
+  /** Archived because they went untouched past `staleDays` at low importance. */
+  staleArchived: number;
+  /** Archived to bring the store back under `maxLiveCards`. */
+  budgetArchived: number;
+  /** Oldest archived cards hard-deleted past `maxArchivedCards`. */
+  archivePruned: number;
+  /** Audit lines dropped past `maxAuditLines`. */
+  auditPruned: number;
+  /** Access-log lines dropped past `maxAccessLines`. */
+  accessPruned: number;
+  /** Consumed inbox lines dropped (line and/or byte budget). */
+  inboxDropped: number;
+  /** Bytes reclaimed by the prunes above. */
+  bytesReclaimed: number;
+  /**
+   * The caller's wall-clock deadline stopped the card sweep early. The
+   * selection is recomputed from scratch next run, so a truncated pass is
+   * simply a partial one — nothing is lost or left half-done.
+   */
+  truncated: boolean;
+}
+
+export interface MaintainReport {
+  dryRun: boolean;
+  stores: StoreMaintenanceResult[];
+  totals: {
+    staleArchived: number;
+    budgetArchived: number;
+    archivePruned: number;
+    auditPruned: number;
+    accessPruned: number;
+    inboxDropped: number;
+    bytesReclaimed: number;
   };
 }
 

@@ -435,7 +435,7 @@ test('capture: mode "explicit" never auto-captures turn text (regression)', asyn
       id: 'sess-explicit',
       header: { cwd: null, delegationDepth: 0 },
       deriveMessages: () => [
-        { role: 'user', content: [{ type: 'text', text: '记住：这条不该被自动捕获，因为模式是 explicit，内容也足够长。' }] },
+        { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '记住：这条不该被自动捕获，因为模式是 explicit，内容也足够长。' }] },
       ],
     };
     listeners.get('session/event')(session, { type: 'turn/end', turn: 1 });
@@ -481,6 +481,9 @@ test('capture: the heuristic pass can be disabled while extraction still runs', 
       deriveMessages: () => [
         {
           role: 'user',
+          // Attribution is producer-owned: only `{ kind: 'user' }` means a
+          // person typed this, and the extraction pass reads human turns only.
+          source: { kind: 'user' },
           content: [
             {
               type: 'text',

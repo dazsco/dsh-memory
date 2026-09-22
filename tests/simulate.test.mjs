@@ -6,9 +6,14 @@ import { defaultMemorySettings } from '../lib/testing.js';
 
 /**
  * E2E wiring test: apply() against a fake cordis Context (structural fakes for
- * the settings service, tools registry, event bus, and fiber timers). This
- * verifies registration, tool execution, capture → inbox → Dream, brief
+ * the tools registry, event bus, and fiber timers) plus a fake live Config.
+ * This verifies registration, tool execution, capture → inbox → Dream, brief
  * injection, and the global kill switch — without a live dsh host.
+ *
+ * The architecture is DSH 0.1.7's: the plugin's settings ARE its Config, read
+ * through volatile references, and a committed edit reaches the owning fiber
+ * as `loader/volatile-update`. `state.settings` is the plain value those
+ * references resolve to, so a test flips a knob by assigning it.
  */
 function makeFakeCtx(state) {
   const timers = {
@@ -19,33 +24,8 @@ function makeFakeCtx(state) {
     },
     interval: (_fn, _ms) => () => undefined, // Dream tick: explicit tool runs only
   };
-  const settingsValue = { ...defaultMemorySettings() };
-  let currentSettings = settingsValue;
-  const settingsService = {
-    register(ns, _schema, _opts) {
-      state.registeredNamespace = ns;
-      const scope = {
-        get: () => currentSettings,
-        watch(cb) {
-          state.settingsWatchers.push(cb);
-          return () => undefined;
-        },
-        update(patch) {
-          const prev = currentSettings;
-          currentSettings = { ...currentSettings, ...patch };
-          for (const cb of [...state.settingsWatchers]) void cb(currentSettings, prev);
-        },
-        replace(section) {
-          currentSettings = { ...section };
-        },
-      };
-      state.settingsScope = scope;
-      return scope;
-    },
-  };
   const ctx = {
     ...timers,
-    settings: settingsService,
     logger: (_name) => ({
       info: () => undefined,
       warn: (m) => state.warnings.push(String(m)),
@@ -55,8 +35,10 @@ function makeFakeCtx(state) {
       state.listeners.push([name, listener]);
     },
     get(name) {
-      if (name === 'settings') return settingsService;
       if (name === 'llm') return state.llm ?? undefined;
+      if (name === 'agentDefaultModel') {
+        return { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-v4-flash' }) };
+      }
       if (name === 'tools') return { register(def) { state.tools.push(def); return () => undefined; } };
       if (name === 'systemPrompt') return { section(o) { state.sections.push(o); return () => undefined; } };
       return undefined;
@@ -66,6 +48,13 @@ function makeFakeCtx(state) {
     },
   };
   return ctx;
+}
+
+/** The volatile Config the Loader would hand `apply` (one ref per section). */
+function fakeConfig(state) {
+  return Object.fromEntries(
+    Object.keys(defaultMemorySettings()).map((key) => [key, { get: () => state.settings[key] }]),
+  );
 }
 
 function emit(ctx, state, name, ...args) {
@@ -87,10 +76,10 @@ test('full wiring E2E against a fake ctx', async () => {
       listeners: [],
       tools: [],
       sections: [],
-      settingsWatchers: [],
       injected: [],
       warnings: [],
-      registeredNamespace: null,
+      // The plain value the fake volatile Config references resolve to.
+      settings: defaultMemorySettings(),
     };
     const ctx = makeFakeCtx(state);
     // Fake auxiliary LLM: returns one implicit memory line for every call.
@@ -112,13 +101,14 @@ test('full wiring E2E against a fake ctx', async () => {
         };
       },
     };
-    T.apply(ctx);
+    T.apply(ctx, fakeConfig(state));
 
     // 1. registration settles (async core init)
-    const ok = await waitFor(() => state.tools.length === 7, { timeoutMs: 8000 });
-    assert.ok(ok, `expected 7 tools, got ${state.tools.length}: ${state.warnings.join(' | ')}`);
-    assert.equal(typeof state.registeredNamespace, 'string');
-    assert.ok(String(state.registeredNamespace).includes('memory'), 'settings namespace registered');
+    const ok = await waitFor(() => state.tools.length === 9, { timeoutMs: 8000 });
+    assert.ok(ok, `expected 9 tools, got ${state.tools.length}: ${state.warnings.join(' | ')}`);
+    // The settings namespace is the Loader row id this bundle inserts; the
+    // Host serves the same string to the browser half's config form.
+    assert.equal(T.MEMORY_NS, 'dsh-memory', 'settings namespace is the row id');
     const usage = state.sections.find((s) => s.name === 'memory:usage');
     assert.ok(usage, 'system-prompt usage section registered');
     assert.equal(usage.order, 150);
@@ -135,6 +125,8 @@ test('full wiring E2E against a fake ctx', async () => {
       'memory_get',
       'memory_update',
       'memory_forget',
+      'memory_gc',
+      'memory_drop_store',
       'memory_status',
       'memory_dream',
     ]) {
@@ -205,7 +197,7 @@ test('full wiring E2E against a fake ctx', async () => {
       id: 'sess-capture',
       header: { cwd: null, delegationDepth: 0 },
       deriveMessages: () => [
-        { role: 'user', content: [{ type: 'text', text: turnText }] },
+        { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: turnText }] },
         { role: 'assistant', content: [{ type: 'text', text: '好的，我会先核对网关配置。' }] },
       ],
     };
@@ -246,8 +238,10 @@ test('full wiring E2E against a fake ctx', async () => {
     const injectedOk = await waitFor(() => state.injected.length === 1, { timeoutMs: 8000 });
     assert.ok(injectedOk, `expected exactly one injection (deduped), got ${state.injected.length}`);
     const msg = state.injected[0];
-    assert.equal(msg.source.kind, 'plugin');
-    assert.equal(msg.source.plugin, 'dsh-memory');
+    // Producer-owned attribution: the brief names this plugin and declares the
+    // recalled form, exactly as the new message-source vocabulary requires.
+    assert.equal(msg.source.kind, 'dsh-memory');
+    assert.equal(msg.source.form, 'recall');
     assert.equal(msg.content[0].type, 'text');
     assert.ok(msg.content[0].text.startsWith('<system-reminder>'));
     assert.ok(msg.content[0].text.includes('8443'), 'brief carries the new memory');
@@ -306,10 +300,10 @@ test('full wiring E2E against a fake ctx', async () => {
     emit(ctx, state, 'agent/created', { agent: legacyAgent, source: 'resume' });
     const legacyOk = await waitFor(() => state.injected.length === 2, { timeoutMs: 8000 });
     assert.ok(legacyOk, `legacy session briefed on first resume (got ${state.injected.length})`);
-    assert.equal(state.injected[1].source.plugin, 'dsh-memory');
+    assert.equal(state.injected[1].source.kind, 'dsh-memory');
 
     // 7. global kill switch: settings.enabled=false disables the write/dream tools
-    state.settingsScope.update({ enabled: false });
+    state.settings.enabled = false;
     const rememberDisabled = remember.execute({ content: 'kill switch 测试内容，足够长的一段话而已。' }, exec('sess-tool'));
     await assert.rejects(() => rememberDisabled, /disabled/);
     const dreamDisabled = dream.execute({}, exec('sess-tool'));
@@ -318,7 +312,7 @@ test('full wiring E2E against a fake ctx', async () => {
     const stOff = await status.execute({}, exec('sess-tool'));
     assert.equal(stOff.enabled, false);
     // re-enable
-    state.settingsScope.update({ enabled: true });
+    state.settings.enabled = true;
     const st2 = await status.execute({}, exec('sess-tool'));
     assert.equal(st2.enabled, true);
 

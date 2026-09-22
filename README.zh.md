@@ -36,8 +36,8 @@ $DSH_HOME/memory/
 
 | DSH 能力 | 用途 |
 | --- | --- |
-| `settings` 服务 | 可实时热重载的 `memory` 命名空间 (GUI + 设置文档) |
-| `tools` 服务 | 7 个面向模型的工具 |
+| `settings` 服务 | 本行自身的实时 Config (`dsh-memory` 的 volatile 字段; GUI + profile patch) |
+| `tools` 服务 | 9 个面向模型的工具 |
 | `commands` 服务 | 人类在输入框敲的 `/memory …`(单命令, 支持中文子命令别名) |
 | `connection` 服务 | 13 条 exact `/api/memory/*` fetch 路由, 经连接鉴权下发给浏览器 |
 | `timer` 服务 | 60s Dream tick + 30s 启动巡检 (服务出现时随时补挂) |
@@ -121,7 +121,7 @@ dsh plugin add link:D:/path/to/dsh-memory --profile web
     model: deepseek-v4-flash
 ```
 
-## 工具 (7 个)
+## 工具 (9 个)
 
 | 工具 | 说明 |
 | --- | --- |
@@ -130,8 +130,10 @@ dsh plugin add link:D:/path/to/dsh-memory --profile web
 | `memory_get` | 按精确 id 读取一张完整卡片 (正文、元数据、链接图、取代指针)。 |
 | `memory_update` | 写入某张卡片的修正版本: 旧卡保留在磁盘上作为历史并退出召回 (双时态取代)。与 `memory_remember` 一样过策略闸门。 |
 | `memory_forget` | 按精确 id 归档 (默认, 可恢复) 或硬删除。按查询遗忘是 **dry run**, 除非传 `confirm=true`, 因此模糊匹配永远不会隐含破坏性操作。 |
+| `memory_gc` | 容量清理: 归档过期/低价值卡片、执行在线卡片上限、裁剪最旧的归档卡片与审计/访问日志、压缩已消费候选池。除非 `confirm=true`, 否则是 **dry run**。 |
+| `memory_drop_store` | 永久删除**单个项目库** (卡片、归档、整理历史、候选池、索引 + 注册表条目)。除非 `confirm=true` 否则是 dry run; 全局库不可删除。 |
 | `memory_status` | 逐库的 卡片 / 归档 / 已取代 计数、待处理候选池、kind 直方图、top 标签、字节数、总量、上次 Dream 运行。记忆关闭时也可用。 |
-| `memory_dream` | 触发后台整理 (摄取、去重、衰减、重链、冲突、重建索引), 或读取其状态。 |
+| `memory_dream` | 触发后台整理 (摄取、去重、衰减、重链、冲突、容量维护、重建索引), 或读取其状态。 |
 
 ## 输入框命令 (DSH `commands`)
 
@@ -144,6 +146,7 @@ dsh plugin add link:D:/path/to/dsh-memory --profile web
 /memory search <query>  | 搜索   在全部已知记忆库中检索
 /memory remember <text> | 写入   写入一条长期记忆
 /memory forget <id>     | 遗忘   归档一条记忆 (可恢复)
+/memory gc [confirm]    | 清理   容量清理 (默认试算, 加 confirm 执行)
 /memory dream           | 整理   立即执行一次 Dream 整理
 /memory help            | 帮助   用法
 ```
@@ -152,7 +155,9 @@ dsh plugin add link:D:/path/to/dsh-memory --profile web
 
 命令没有图标: 输入框菜单行的图标只能来自客户端 `CommandContribution` (`ui-commands`) 或第一方的 `HOST_FACES` 表, 而客户端贡献**不允许与宿主命令同名** (客户端会抛 `contribution /<name> collides with a host command`)。因此想要图标就必须把 `/memory` 整体搬到客户端, 代价是失去可输入子命令、结果文本与非 Web 客户端的可用性 —— 不值得。
 
-## 设置 (namespace `memory`, GUI: Settings → Plugins → dsh-memory)
+## 设置 (namespace `dsh-memory`, GUI: Plugins → dsh-memory → Configure)
+
+DSH 0.1.7 起, 插件自身的 `Config` 通过 `ctx.settings` 投影为表单, 表单命名空间就是 **Loader 行 id** — 对本 bundle 即 `dsh-memory`(包名)。下表每一节都声明为 `.volatile()`, 因此一次保存会直接写进运行中行的引用, 不重挂载; 用户层是 profile patch (`$DSH_PROFILE_DIR/cordis.patch.yml`), 本 bundle 的 `cordis.patch.yml` 是组合层, 下表默认值是最底层。同一份值也可以用设置文档读写, 所以 CLI 与 GUI 是同一写入路径。
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
@@ -160,6 +165,8 @@ dsh plugin add link:D:/path/to/dsh-memory --profile web
 | `capture.mode` | `auto` | `off` 不捕获 / `explicit` 仅显式 (完全不做自动捕获) / `auto` 轮次结束抽取 |
 | `capture.useLlm` | `true` | 抽取走用户 LLM 路由 |
 | `capture.heuristic` | `true` | 对用户陈述做基于规则的意图抽取 |
+| `capture.llmMaxCallsPerSession` | `20` | 单个会话的辅助抽取调用上限 (`0` = 不限)。抽取会重读会话尾部, 被跳过的轮次由下一次调用覆盖 |
+| `capture.llmMinIntervalMs` | `30000` | 同一会话两次抽取调用的最小间隔 (`0` = 不限制); 把快速连续多轮合并为一次调用, 而不是每轮一次 |
 | `capture.turnTailChars` | `20000` | 送入抽取的轮次尾部字符数 |
 | `capture.minTurnContentChars` | `120` | 短于该长度的轮次不捕获 |
 | `capture.compaction` | `true` | 把 harness 的压缩摘要暂存为 `summary` 候选 |
@@ -177,8 +184,27 @@ dsh plugin add link:D:/path/to/dsh-memory --profile web
 | `recall.briefIncludeSuperseded` | `false` | 会话简报是否包含已被取代的卡片 |
 | `commands.enabled` | `true` | 注册 `/memory`(唯一命令; 子命令已覆盖旧的 `/remember`) |
 | `budget.maxCardBytes` / `maxInboxLines` | `4096` / `1000` | 单卡字节上限 / 候选池行数上限 (Dream 每次运行后压缩**已消费**头部; 未消费尾部永不丢弃) |
-| `llm.provider` / `model` | `''` | 逐字段覆盖。解析顺序 (每字段取首个非空): ① 本设置 → ② 会话实时默认模型 (`agent-default-model` 命名空间, 插件随 agent 自身路由走) → ③ 组合行 `llm:` 路由兜底 |
+| `maintenance.enabled` | `true` | 每次 Dream 结束时执行容量维护 |
+| `maintenance.staleDays` / `staleMaxImportance` | `180` / `6` | 超过该天数未更新且重要性 ≤ 上限的在线卡片会被归档 (`staleDays: 0` 关闭; `preference`/`commitment` 豁免) |
+| `maintenance.maxLiveCards` | `2000` | 单库在线卡片上限; 超出后归档价值最低的卡片 (常驻类最后) |
+| `maintenance.maxArchivedCards` | `2000` | 单库归档卡片上限; 超出后**硬删除最旧**的归档 |
+| `maintenance.maxAuditLines` / `maxAccessLines` | `4000` / `4000` | 单库日志行数上限 (保留最新) |
+| `maintenance.maxInboxBytes` | `1000000` | 单库候选池字节上限 (优先丢弃已消费头部) |
+| `llm.provider` / `model` | `''` | 逐字段覆盖。解析顺序 (每字段取首个非空): ① 本设置 → ② 部署的实时默认模型 (`ctx.agentDefaultModel.currentSelection()`, 插件随 agent 自身路由走) → ③ 本插件内置兜底路由 (`deepseek` / `deepseek-v4-flash`)。留空即继承; 也可以用组合行固定路由 |
 | `llm.maxOutputTokens` / `timeoutMs` | `2000` / `60000` | 单次辅助调用输出上限 / 超时 |
+
+## 容量与清理
+
+只增不减的记忆会让每次召回、每次 Dream、每次索引写入都越来越慢, 因此本插件是**有界**而非累积式的:
+
+- **热路径有界。** 召回只在**有上限的候选池**上排序, 且贪心 MMR 在选出 `k` 条后立即停止 (旧实现每次都对整个语料排序, 实际是立方级复杂度)。Dream 去重为每张卡只构建一次 token 集合 (旧实现为每个候选池条目重建全部卡片集合); 重链改由标签倒排索引驱动 (旧实现是全量两两扫描); 冲突通道有比较次数上限。所有长循环最多每 8ms 让出一次事件循环, 因此大规模整理不会卡死 harness。
+- **增量索引。** `index.json` 按单卡增量更新 (精确维护 `docCount` / `avgDocLen` / `df`), 不再每次写入都重读全部卡片文件; 索引以紧凑格式 (非缩进) 落盘, 每卡持久化的 token 数组也有上限。
+- **自动维护** (每次 Dream 的第 6 个 pass, `maintenance.*`): 归档过期低重要性卡片、执行在线卡片上限、裁剪归档 / 审计 / 访问日志 / 候选池预算。该 pass 遵循本次运行的墙钟预算 (被截断的清理下次继续), 所有上限都可在 **Plugins → dsh-memory → Configure** 的「写入预算」「容量与清理」分组中调整。
+- **写入突发有界。** 全新的库会一次性改变所有卡片的链接; 重链 pass 每次运行最多写 500 张卡 (幂等, 剩余部分在后续运行收敛), 辅助抽取调用按会话节流 (`capture.llmMaxCallsPerSession` / `llmMinIntervalMs`), 长会话不再每轮多发一次模型调用。
+- **按需清理**: `memory_gc` 工具与 `/memory 清理 [slug] [confirm]`。除非确认, 两者都是 **dry run**, 并逐库报告会归档什么、裁剪什么、回收多少字节。
+- **彻底重置**: 直接删除 `$DSH_HOME/memory/projects/<slug>` (或 `$DSH_HOME/memory/global`) 即可清空该库; `memory_drop_store` / `/memory 删除库 <slug>` 可删除单个项目库并同时清理注册表条目。
+
+没有任何东西会被静默丢弃: 卡片清理都是**归档** (文件移入 `archive/`, 可在 Settings → Memory → Archive 恢复); 只有归档/日志裁剪不可逆, 且仅在超出配置上限时发生。
 
 ## 导出与导入
 
@@ -191,10 +217,14 @@ dsh plugin add link:D:/path/to/dsh-memory --profile web
 npm install
 npm run build      # esbuild: lib/index.js (host) + lib/testing.js + lib/client.js (GUI 设置卡片 + 记忆页)
 npm run typecheck
-npm test           # node --test tests/**/*.test.mjs (138 tests)
+npm test           # 快速套件 (node --test tests/**/*.test.mjs)
+npm run test:scale # 规模守卫 (tests/**/*.slow.mjs) —— 较慢, 发布前必跑
+npm run bench      # 实测召回/写入/Dream 成本; `-- 3000`、`--old` 可对比新旧形态
 ```
 
-- `src/` host 平面 (store / core / capture / recall / dream / tools / commands / brief / settings / browse / llm); `src/client/` 浏览器平面 (插件设置 tab `settings.plugins.tab` + 记忆页 `settings.section`)。
+- `docs/PERFORMANCE.md` 记录了实测热路径、仍为线性的两处、各项上限, 以及**刻意未实现**的设计草案 (倒排表、索引分片、hub 标签) —— 连同触发条件一起写明。
+
+- `src/` 是 host 平面 (store / core / capture / recall / dream / tools / commands / brief / settings / browse / llm); `src/client/` 是浏览器平面 (插件自身配置表单注册进 `plugins.bundle.config` + `plugins.row.config`, 记忆页注册进 `settings.section`)。
 - 每项 host 贡献都注册在它所需的服务作用域内 (`ctx.inject([...])`), 因此任意挂载顺序都成立, 可选服务缺失只告警一次, 释放时随 fiber 解绑。行配置在挂载时由导出的 `Config` schema 校验。
 - 召回、简报、Dream 与管理页都从派生索引打分 (`index.json` v2 保留每张卡的 `terms`); 没有任何读路径会重新打开每一张卡片文件。规则文件以 mtime 为缓存键。`src/browse.ts` 拥有路由表 (`MEMORY_BROWSE_ROUTES`), 测试也以它为准做断言。
 - LLM 全部走注入的 `llm` 服务 + 硬超时, **任何 LLM 失败都不可致命** (卡死流受单次调用超时约束, 单一迭代器被取消而非重入); 工具返回匿名 JSON 安全字面量。
@@ -204,7 +234,7 @@ npm test           # node --test tests/**/*.test.mjs (138 tests)
 
 - 组合行挂载: `dsh --profile web --dump-config` 出现 `dsh-memory` 行 (含 llm 路由)。
 - 客户端 bundle: `GET /plugins/dsh-memory/client.js` 200, `__ModuleLoader__` 包装完整。
-- 设置面: `settings.describe` 返回 `memory` 命名空间全量默认值; 嵌套路径 `settings.mutate` set/unset 双向验证通过。
+- 设置面: `settings.describe` 返回 `dsh-memory` 命名空间全量默认值; 嵌套路径 `settings.mutate` set/unset 双向验证通过 (已被下方 v0.5.0 记录中的 entry-id 命名空间取代)。
 - 工具: 真实会话中 `memory_status` 返回双库实况 (全局 + `D-Repos-tanke` 项目库自动注册)。
 - Dream: 真实进程 `memory_dream` 35ms 完成, `lastDream` 检查点写入, 幂等。
 - 密钥闸门: 伪造 key 被拦截 (`blocked:true`), 未落盘。
@@ -241,3 +271,50 @@ npm test           # node --test tests/**/*.test.mjs (138 tests)
 - **验证**: `npm run typecheck` 无错; `npm run build` 产出 lib/index.js + lib/testing.js + lib/client.js; `npm test` → **138/138** (118 基线 + 20 条新 v3 用例, 覆盖索引迁移、自愈、取代路径、过滤器、链接扩展、导出/导入、dry-run 遗忘、状态结构、压缩捕获、命令面与新路由; 另有 wiring E2E 中 `memory_get` / `memory_update` / 带过滤召回的工具边界用例)。
 - **线上验收 (web profile, 原地升级)**: bundle 安装并激活为 `include:dsh-memory` (`fiberPhase: active`), 写入 profile 的 `dsh.profile.bundles` 与 `dependencies`, 重启后仍然生效, 且零激活告警。随后用插件自身的工具对**真实记忆库**做了验证: `memory_status` 返回新结构 (`schema: 2`、`totals`, 以及每个库的 `superseded`/`kinds`/`topTags`/`bytes`), 覆盖 **7 个库 / 441 张卡片** —— 说明 v1→v2 索引迁移在既有数据上静默完成; `memory_recall` 用 `scope:"all"` 检索了全部库, `minImportance`/`scope` 过滤器可组合; `memory_get` 读出一张 v2 之前的卡片并显示 `supersededBy: null`, 证明对真实旧文件的向后兼容。
 - **环境说明 (非插件缺陷)**: 本机沙箱会静默吞掉符号链接创建 (`mklink /D` 报告成功但链接并不存在; junction 正常)。因此 pnpm 会记录依赖却不会在 `node_modules` 顶层生成条目, `plugin_manager install_bundle` 首次解析必然失败。修复方式: 把 `…/profiles/web/node_modules/dsh-memory` 建成指向仓库的 **junction**, 再重跑 `plugin_manager install_bundle` —— pnpm 不会动已存在的条目, 激活随即完成。记忆管理页与 `/memory` 命令需要真人在浏览器/输入框中操作; 本次会话没有浏览器控制能力, 且所有 HTTP 路由都需要鉴权 (401), 因此这两处由客户端 bundle 构建 + 宿主路由/命令测试覆盖, 而非点击验证。
+
+## 验收记录 (v0.4.0 — 容量与性能加固, 2026-09-25)
+
+**问题**: 记忆只增不减; 项目库累积到数百至数千张卡片后, dsh 明显变卡。
+
+**根因** (全部同步跑在 harness 的同一个事件循环上):
+
+1. `rankWithMmr` 对**整个候选集**做贪心 MMR 之后才 `slice(0, k)` —— 内层还要遍历已选集, 实际是 **O(N³)**, 且每次召回都跑 (会话简报一次会话跑两次)。实测 1000 张卡片时单次排序 **130.8 秒**。
+2. Dream 重链 pass 对每张卡遍历全部卡片, 且**每一对都 `new Set(tokens)`** —— O(N²) 集合构造。
+3. Dream 去重 pass 为**每个候选池条目**重建全部卡片的 token 集合 —— O(候选 × 卡片) 集合构造。
+4. 每次显式写入 (`remember`/`update`/`forget`/`restore`) 都做全量 `rebuildIndex` (O(N) 次文件读 + 数 MB JSON 序列化)。
+5. 无界增长: 在线卡片无上限 (只有 `observation` 有 14 天衰减)、审计日志永不裁剪、访问日志只在 Dream 时清空、候选池只按行数压缩 (单行上限 20KB)、索引含全量 `terms` 且**缩进**写入。
+6. 热路径反复整文件读取: `inboxLineCount` 每次 tick/status 全读; `readAuditTail` 解析整个审计文件只为取最后 50 行。
+
+**修复**:
+
+- **召回有界**: 候选池按分数截断 (≥240 或 12×k), MMR 只做 k 轮 → O(pool·k)。3000 张卡片时 MMR 12ms, `core.recall` 端到端 36–52ms (与 N 基本无关)。
+- **Dream 有界**: 每卡 token 集合每轮只建一次; 重链改由标签倒排索引驱动 (语义不变: 仍需 ≥2 共享标签、按共享数取前 5); 冲突通道加 token 长度预筛 + 20000 次比较上限; 所有长循环最多每 8ms 让出事件循环。
+- **索引增量**: 单卡增量更新 (精确维护 `docCount`/`totalTokens`/`df`), 紧凑写入, 每卡 `terms` 上限 1024; 缺少 `bm25.totalTokens` 的旧索引自动回退全量重建。
+- **批量化**: `patchCards` 单次加锁批量写; 卡片文件读写 16 路并发 (3000 卡重建 1.26s → 0.48s); 访问计数改为进程内缓冲、批量落盘 (顺带消除 recall 的游离 promise 与测试 teardown 竞态)。
+- **索引原地增量 + 批量清理**: 单卡索引更新不再拷贝 `cards`/`df` (此前**每次写入**都是 O(卡片数 + 词表), 现在只与变更卡片相关); `archiveCards` + `auditMany` 把批量清理收敛为每 256 张卡一次加锁 / 一次索引更新 / 一次审计追加 —— 3000 张卡超限库的首次 Dream 因此从 13.5s 降到 **6.5s**。
+- **有界增长**: 新增 `maintenance.*` 上限, 由 Dream 第 6 个 pass 自动执行; 审计/访问日志支持真实 tail 读与裁剪; 候选池按行 + 字节双预算压缩; 归档卡片有上限。
+- **写入突发与每轮成本有界**: Dream 的墙钟预算现在会传到衰减/重链/维护 pass (被截断的部分下次继续), 重链写入每次运行上限 500 张; 辅助捕获调用改为按会话节流 (预算 + 最小间隔), 不再每轮一次; 打分语料按索引对象缓存, 召回不再重建全量 Map; `budget.*` / `maintenance.*` 已可在 GUI 设置卡中调整。
+- **清理通道**: `memory_gc` 工具 + `/memory 清理 [slug] [confirm]` (默认 dry run, 逐库报告归档/裁剪/回收字节); 卡片清理一律**归档** (可从 GUI 归档页恢复)。
+
+**实测** (本机 Windows, N=1000): MMR 124282ms → **4ms**; 重链 5179ms → 330ms (≈16×); 单次写入 153ms (全量重建) → 34ms (增量)。N=3000 时召回 27–53ms, Dream 稳态 **2.9s**。完整成本画像、仍为线性的两处以及刻意未实现的设计草案见 `docs/PERFORMANCE.md`。
+
+- **破坏性变更**: `StoreDreamResult` 新增 `pruned`; `StoreMaintenanceResult` 新增 `truncated`; `archiveCard`/`deleteCardHard`/`restoreCard` 新增 `opts.rebuild`; 新增 `capture.llmMaxCallsPerSession`/`llmMinIntervalMs`、settings 段 `maintenance`、工具 `memory_gc`、命令 `/memory 清理`; 索引 schema 仍为 2 (新增可选字段 `bm25.totalTokens`)。
+- **验证**: `npm run typecheck` 无错; `npm run build` 产出 lib/index.js + lib/testing.js + lib/client.js; `npm test` → **162/162** 快速用例 (147 基线 + 15 条新用例: 维护策略/试算与执行/归档与日志预算/候选池按行与按字节只丢已消费头/超时截断清理/增量索引与全量重建逐字段一致/旧索引升级/`memory_gc`/`/memory 清理`/捕获调用按预算·间隔·会话节流), 另 `npm run test:scale` → **3/3** 规模守卫。上述所有数字都可用 `npm run bench` 复现。
+
+## 验收记录 (v0.5.0 — DSH 0.1.7 适配, 2026-09-22)
+
+harness 从独立的 settings 命名空间注册表改为**插件自身的 Config**(`describe`/`update`/`mutate` 针对某个 Loader entry, 只有 `.volatile()` 字段可编辑, 且编辑直接提交进运行中的 fiber), 并废弃了共享的 `{kind:'plugin'}` 消息来源, 改为生产者自有 kind。本版本同时适配这两点。
+
+**破坏性变更**
+
+- 设置命名空间是**行 id** `dsh-memory`(不再是 `memory`); 插件全部配置就是它导出的 `Config` schema (`MemorySettingsSchema`), 每节一个 volatile 字段。不再有 `settings.register`/`scope.get()`, 组合行也不再带 `llm:` 路由 —— 空的 `llm.provider`/`model` 依次继承 `ctx.agentDefaultModel` 与本插件内置兜底路由。
+- 本插件产出的消息归属为 `{ kind: 'dsh-memory' }`(会话简报为 `form: 'recall'`)。简报的持久去重仍识别两种旧写法 (session-format 读取器把已发布会话改写成 `plugin:dsh-memory`, 以及未迁移的原始 `{kind:'plugin', plugin:'dsh-memory'}`), 因此升级后恢复会话不会被重复注入。
+- 捕获改为按 `source.kind === 'user'` 判定人类文本 —— 在生产者的来源词表中这是唯一表示"人打的字"的来源 —— 不再用 `plugin`/`tool` 黑名单。
+- 浏览器半部把配置表单注册进 Plugins 页自己的位置 (`plugins.bundle.config` 按包名, `plugins.row.config` 按 `dsh-memory#dsh-memory`), 并通过 `ctx.configForms.get('dsh-memory')` 读取; 旧的 `settings.plugins.tab` 标签页已移除。卡片保留暂存字段、分组与保存/放弃, 现在内联渲染 (标题与一句话描述由页面绘制), 行摘要走 `view: 'summary'`。
+
+**验证**
+
+- `npm run typecheck` 无错; `npm run build` 产出 lib/index.js + lib/testing.js + lib/client.js; `npm test` → **173/173** 快速用例 (162 基线, 已改造到新夹具: 真实用户夹具一律带 `{kind:'user'}`, checkpoint marker 用例改为在人类来源的消息上验证 marker, wiring E2E 改为驱动假 volatile Config; 另加 `tests/v5.test.mjs` 7 条设置契约用例与 `tests/client.test.mjs` 4 条浏览器半部用例 —— 在无浏览器环境下物化已构建的 bundle)。
+- **线上验收 (web profile, 原地升级)**: `plugin_manager install_bundle link:D:/Repos/dsh/dsh-memory` → `application: applied`; 组合行在 `Config.listConfigs` 中为 `include:dsh-memory`, `status: schema`, 投影出的表单显示全部十节 `x-cordis.volatile: true`。该行的 9 个工具 (`Tool.listTools`) 与浏览器注册 (`Slots.listSubTree` → `settings.section` 占用者 `memory`、`plugins.row.config` 占用者 `dsh-memory#dsh-memory`, 均 `active`) 在运行中的 Host 与页面上均为实时状态。
+- **线上设置往返**: 往 `$DSH_PROFILE_DIR/cordis.patch.yml` 的组合层写入 `enabled: false` 后, 运行中的 `memory_status` 立即变为 `enabled:false` 且未重挂载; 同一层写入 `dream.requestSeq: 5` 后, 行的 `loader/volatile-update` 监听器立刻跑了一次 Dream (`lastDream` 从 `""` 变为真实时间戳)。临时覆盖随后已删除, profile 恢复原状。
+- **未做点击验证**: 本次会话没有浏览器控制能力, 且 Web 路由需要鉴权 (401), 因此卡片的实际渲染与记忆页是通过实时 Client slot 台账 + 客户端 bundle 构建验证的, 而非点击。证据是 slot 的 `active` 状态与 Host 侧 Config 往返。

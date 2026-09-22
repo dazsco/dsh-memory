@@ -73,6 +73,20 @@ const MIN_SENT = 6;
 const MAX_SENT = 400;
 const MAX_CANDIDATES = 5;
 
+/** Per-session throttle state for the auxiliary extraction call. */
+interface LlmThrottle {
+  calls: number;
+  lastAt: number;
+  /** One info line per session when the budget runs out (never one per turn). */
+  budgetLogged: boolean;
+}
+
+/** Refusal (or grant) of one auxiliary-LLM slot. */
+type LlmSlot = { ok: true } | { ok: false; reason: string; logOnce: boolean };
+
+/** Distinct sessions whose throttle state is retained (oldest evicted). */
+const LLM_THROTTLE_SESSIONS = 200;
+
 /**
  * Remove machine-injected `<system-reminder>` blocks (memory brief, skill
  * catalog, runtime context). Their boilerplate is never a user statement and
@@ -83,13 +97,19 @@ export function stripSystemReminders(text: string): string {
 }
 
 /**
- * Machine-injected content is never a user statement: any message whose
- * source is a plugin injection or a tool result is skipped, regardless of
- * which plugin produced it (dsh-memory brief, harness checkpoints that ride
- * plugin sources, ...). Unknown / merge-extensible source kinds are kept.
+ * Machine-injected content is never a user statement.
+ *
+ * Attributed sources are producer-owned in this harness: there is no shared
+ * `plugin` kind any more, and every plugin/native producer declares its own
+ * (dsh-memory briefs, harness checkpoints, skill catalogs, schedule
+ * reminders, goal rounds, ...). The ONLY source that means "a person typed
+ * this" is `{ kind: 'user' }` — the union's human member, which the Web RPC,
+ * ACP, SDK, and headless entry points all stamp. So a user-role message
+ * counts as a user statement exactly when its source kind is `user`;
+ * anything else (including a missing source) is machine context.
  */
-function isMachineInjected(source: { kind?: string; plugin?: string } | null | undefined): boolean {
-  return source?.kind === 'plugin' || source?.kind === 'tool';
+function isUserAuthored(source: { kind?: unknown } | null | undefined): boolean {
+  return source?.kind === 'user';
 }
 
 /**
@@ -172,6 +192,43 @@ export function registerCapture(
   const pending = new Map<string, () => void>();
   /** Summary digests already staged per session (compaction may repeat). */
   const stagedSummaries = new Map<string, Set<string>>();
+  /** Per-session auxiliary-LLM throttle (see {@link takeLlmSlot}). */
+  const llmThrottle = new Map<string, LlmThrottle>();
+
+  /**
+   * Take (or refuse) one auxiliary-LLM slot for a session. The extraction pass
+   * is an EXTRA model call riding the same route as the agent, so an
+   * unthrottled turn-end capture competes with the user's own turn for
+   * provider concurrency and cost. Refusing is nearly lossless: the pass
+   * re-reads the last `turnTailChars` of the conversation, so whatever was
+   * skipped is covered by the next call that IS allowed.
+   */
+  function takeLlmSlot(sessionId: string, s: MemorySettings): LlmSlot {
+    let t = llmThrottle.get(sessionId);
+    if (t === undefined) {
+      t = { calls: 0, lastAt: 0, budgetLogged: false };
+      llmThrottle.set(sessionId, t);
+      // Bound the map: a long-lived host sees many sessions; drop the oldest.
+      if (llmThrottle.size > LLM_THROTTLE_SESSIONS) {
+        const oldest = llmThrottle.keys().next().value;
+        if (oldest !== undefined) llmThrottle.delete(oldest);
+      }
+    }
+    const max = s.capture.llmMaxCallsPerSession;
+    if (max > 0 && t.calls >= max) {
+      const firstTime = !t.budgetLogged;
+      t.budgetLogged = true;
+      return { ok: false, reason: `session LLM budget exhausted (${max} call(s))`, logOnce: firstTime };
+    }
+    const gap = s.capture.llmMinIntervalMs;
+    const now = Date.now();
+    if (gap > 0 && t.lastAt > 0 && now - t.lastAt < gap) {
+      return { ok: false, reason: `throttled (min interval ${gap}ms)`, logOnce: false };
+    }
+    t.calls++;
+    t.lastAt = now;
+    return { ok: true };
+  }
 
   ctx.on('session/event', (...args: unknown[]) => {
     const session = args[0] as SessionLike | undefined;
@@ -277,9 +334,10 @@ export function registerCapture(
       const m = messages[i];
       if (m === undefined) continue;
       if (m.role !== 'user' && m.role !== 'assistant') continue;
-      // Skip machine-injected messages (any plugin/tool source): machine
-      // context is never a user memory statement.
-      if (isMachineInjected(m.source)) continue;
+      // A user-role message counts as a user statement only when a person
+      // authored it; every other producer's user-role message (memory briefs,
+      // checkpoints, skill catalogs, reminders) is machine context.
+      if (m.role === 'user' && !isUserAuthored(m.source)) continue;
       const text = stripSystemReminders(
         (m.content ?? [])
           .filter((b) => b.type === 'text' && typeof b.text === 'string')
@@ -312,24 +370,31 @@ export function registerCapture(
     // so every turn in a no-llm deployment does not append a
     // `skipped no-llm-service` audit entry.
     if (s.capture.useLlm && llmDeps !== null && llmDeps.llm !== null) {
-      const system =
-        targetStore === core.global
-          ? captureSystemPrompt({ kind: 'global' })
-          : captureSystemPrompt({ kind: 'project', slug: targetStore.slug });
-      const pass = await runLlmPass(tail, candidates, llmDeps, system);
-      llmLines = pass.lines;
-      // Audit trail so the auxiliary-call path is observable (ok / skipped /
-      // error) — previously a silent skip left no trace at all.
-      await targetStore
-        .audit({
-          ts: new Date().toISOString(),
-          store: targetStore.slug,
-          op: 'llm',
-          detail: pass.status === 'ok' ? `ok n=${llmLines.length}${pass.truncated ? ' truncated' : ''}` : `${pass.status}${pass.reason ? ` ${pass.reason}` : ''}`.slice(0, 160),
-          via: 'auto',
-          session: sess.id,
-        })
-        .catch(() => undefined);
+      const slot = takeLlmSlot(sess.id, s);
+      if (!slot.ok) {
+        // Throttled: NO per-turn audit line (that per-turn noise was the F9
+        // regression); one info line when the session budget actually runs out.
+        if (slot.logOnce) logger?.info(`[dsh-memory] capture LLM pass paused for this session: ${slot.reason}`);
+      } else {
+        const system =
+          targetStore === core.global
+            ? captureSystemPrompt({ kind: 'global' })
+            : captureSystemPrompt({ kind: 'project', slug: targetStore.slug });
+        const pass = await runLlmPass(tail, candidates, llmDeps, system);
+        llmLines = pass.lines;
+        // Audit trail so the auxiliary-call path is observable (ok / skipped /
+        // error) — previously a silent skip left no trace at all.
+        await targetStore
+          .audit({
+            ts: new Date().toISOString(),
+            store: targetStore.slug,
+            op: 'llm',
+            detail: pass.status === 'ok' ? `ok n=${llmLines.length}${pass.truncated ? ' truncated' : ''}` : `${pass.status}${pass.reason ? ` ${pass.reason}` : ''}`.slice(0, 160),
+            via: 'auto',
+            session: sess.id,
+          })
+          .catch(() => undefined);
+      }
     }
     if (candidates.length === 0 && llmLines.length === 0) return;
 

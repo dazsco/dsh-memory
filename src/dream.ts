@@ -9,7 +9,14 @@
  *   4b. LLM      — budgeted auxiliary passes on the user's own route
  *                  (summarize → dream/summary.md; conflict → resolve
  *                  near-duplicate pairs the Jaccard band left open)
+ *   6. maintain  — capacity ceilings: archive stale/over-budget cards and
+ *                  prune the archive/audit/access budgets (runs BEFORE the
+ *                  reindex so its archivals land in the same rebuild)
  *   5. reindex   — rebuild index.json (derived, always recomputable)
+ *   7. inbox     — compact the consumed head (line + byte budgets)
+ *
+ * Every long pass yields to the event loop (see createYielder) so a large
+ * consolidation never freezes the harness it shares.
  *
  * LLM passes are best-effort: any unavailability (no service, route, budget,
  * or a failed call) degrades to the heuristic result; the run still succeeds.
@@ -30,7 +37,8 @@ import { gateCandidate } from './redact.ts';
 import { cardStrength, jaccard, tokenize } from './retrieval.ts';
 import { dedupDecide, normalizeMemoryText } from './dedup.ts';
 import { makeCardId } from './cards.ts';
-import { listFiles } from './fsutil.ts';
+import { createYielder, listFiles } from './fsutil.ts';
+import { maintainStore, maintenanceLimitsFrom } from './maintain.ts';
 import { MEMORY_KINDS } from './types.ts';
 import type { DreamState, InboxEntry, MemoryCard, MemoryKind } from './types.ts';
 import type { MemorySettings } from './settings.ts';
@@ -88,6 +96,8 @@ export interface StoreDreamResult {
   superseded: number;
   blocked: number;
   relinked: number;
+  /** Archive/log lines removed by the capacity-maintenance pass. */
+  pruned: number;
   notes: string[];
   error?: string;
 }
@@ -220,6 +230,7 @@ export class DreamEngine {
       superseded: 0,
       blocked: 0,
       relinked: 0,
+      pruned: 0,
       notes: [],
     };
     const nowIso = () => now().toISOString();
@@ -260,13 +271,32 @@ export class DreamEngine {
             else view.push({ kind: 'entry', entry: entries[e++]! });
           }
         }
-        const corpus = await store.cardCorpus();
+        const corpus = await store.cardCorpusCopy();
+        // Token sets are materialized ONCE per run and kept in lockstep with
+        // `corpus`. The previous shape rebuilt a Set for EVERY card for EVERY
+        // inbox entry — O(inbox × cards) Set constructions, which was the
+        // dominant CPU cost of a Dream run on a store that had accumulated a
+        // few hundred cards (and it ran on the harness's own event loop).
+        const tokenSets = new Map<string, Set<string>>();
+        for (const [id, e] of corpus) tokenSets.set(id, new Set(e.tokens));
+        const EMPTY_TOKENS: ReadonlySet<string> = new Set<string>();
+        let dedupPool: { id: string; tokens: ReadonlySet<string> }[] | null = null;
+        const dedupCandidates = (): { id: string; tokens: ReadonlySet<string> }[] => {
+          if (dedupPool === null) {
+            dedupPool = [...corpus.keys()].map((id) => ({ id, tokens: tokenSets.get(id) ?? EMPTY_TOKENS }));
+          }
+          return dedupPool;
+        };
+        const yieldNow = createYielder();
         let consumed = 0;
         for (const item of view) {
           if (Date.now() > deadline) {
             res.notes.push('wall budget exhausted; inbox resumes next run');
             break;
           }
+          // Long ingest batches must not monopolize the event loop: yield at
+          // most once per 8 ms so the harness keeps answering while Dream runs.
+          await yieldNow();
           if (item.kind === 'malformed') {
             // A partial JSON line (kill -9 mid-append): quarantine — audit it
             // and advance past it so the next run resumes after it. No content
@@ -295,10 +325,7 @@ export class DreamEngine {
           }
           const tokens = tokenize(gated.text);
           const tokenSet = new Set(tokens);
-          const decision = dedupDecide(
-            tokenSet,
-            [...corpus.entries()].map(([id, e]) => ({ id, tokens: new Set(e.tokens) })),
-          );
+          const decision = dedupDecide(tokenSet, dedupCandidates());
           if (decision.action === 'noop' && decision.matchId) {
             res.noop++;
             const meta = corpus.get(decision.matchId)?.meta;
@@ -366,6 +393,8 @@ export class DreamEngine {
             bytes: Buffer.byteLength(`${card.title}\n${card.body}`, 'utf8'),
           };
           corpus.set(card.id, { meta, tokens });
+          tokenSets.set(card.id, tokenSet);
+          dedupPool = null; // the new card must join the dedup candidate pool
           res.added++;
           consumed++;
         }
@@ -375,6 +404,10 @@ export class DreamEngine {
         state.inboxOffset += consumed;
 
         // ── pass 2: fold access log into counters ──────────────────────────
+        // Recall notes are buffered in-process (one append per batch instead of
+        // one per recall); flush them before reading so this run folds every
+        // count the process is holding.
+        await store.flushAccess();
         const access = await store.readAccessLog();
         if (access.length > 0) {
           const counts = new Map<string, { n: number; last: string }>();
@@ -388,14 +421,23 @@ export class DreamEngine {
           }
           // Corpus metadata, not the on-disk index: pass 1 may have added cards
           // with `rebuild:false`, so the index file is deliberately stale here.
+          // One batched write: folding access into hundreds of cards used to
+          // take one lock + read + write per card.
+          const accessPatches: { id: string; patch: { accessCount: number; lastAccessed: string } }[] = [];
           for (const [id, c] of counts) {
             const meta = corpus.get(id)?.meta;
             if (!meta) continue;
+            accessPatches.push({ id, patch: { accessCount: meta.accessCount + c.n, lastAccessed: c.last } });
+          }
+          if (accessPatches.length > 0) {
             // rebuild: false — pass 5 rebuilds the index once for the run.
-            const patched = await store.patchCard(id, { accessCount: meta.accessCount + c.n, lastAccessed: c.last }, { rebuild: false });
-            if (patched !== null) {
-              meta.accessCount += c.n;
-              meta.lastAccessed = c.last;
+            await store.patchCards(accessPatches, { rebuild: false });
+            for (const p of accessPatches) {
+              const meta = corpus.get(p.id)?.meta;
+              if (meta !== undefined) {
+                meta.accessCount = p.patch.accessCount;
+                meta.lastAccessed = p.patch.lastAccessed;
+              }
             }
           }
           await store.clearAccessLog();
@@ -404,8 +446,13 @@ export class DreamEngine {
         // ── pass 3: decay & archive ────────────────────────────────────────
         const rules = await this.core.rulesFor(store.slug);
         const nowD = now();
+        const decayed: { id: string; why: string }[] = [];
         for (const [id, { meta }] of [...corpus.entries()]) {
           if (meta.validUntil !== null) continue;
+          if (Date.now() > deadline) {
+            res.notes.push('wall budget exhausted during decay; resumes next run');
+            break;
+          }
           let why = '';
           const kindDays = rules.retention[meta.kind];
           if (kindDays !== undefined && daysSince(meta.updated, nowD) > kindDays) {
@@ -418,39 +465,97 @@ export class DreamEngine {
             why = 'observation-decay';
           }
           if (!why) continue;
-          const ok = await store.archiveCard(id);
-          if (!ok) continue;
-          await store.audit({ ts: nowIso(), store: store.slug, op: 'archive', id, detail: why, via: 'dream' });
-          corpus.delete(id);
-          res.archived++;
-          res.notes.push(`archive ${id} (${why})`);
+          decayed.push({ id, why });
+        }
+        if (decayed.length > 0) {
+          // One batched archive + one audit append: a retention sweep can touch
+          // hundreds of cards, and doing that per card took a lock each time.
+          const moved = new Set(await store.archiveCards(decayed.map((d) => d.id), { rebuild: false }));
+          const rows: import('./types.ts').AuditEntry[] = [];
+          let noted = 0;
+          for (const d of decayed) {
+            if (!moved.has(d.id)) continue;
+            corpus.delete(d.id);
+            res.archived++;
+            rows.push({ ts: nowIso(), store: store.slug, op: 'archive', id: d.id, detail: d.why, via: 'dream' });
+            if (noted < 10) {
+              res.notes.push(`archive ${d.id} (${d.why})`);
+              noted++;
+            }
+          }
+          if (moved.size > noted) res.notes.push(`…and ${moved.size - noted} more retention archive(s)`);
+          await store.auditMany(rows).catch(() => undefined);
         }
 
         // ── pass 4: relink by tag co-occurrence ────────────────────────────
         // Only LIVE cards participate: linking to a superseded card would
         // promote history back into recall through the graph.
+        //
+        // Semantics are unchanged (a link needs ≥2 shared tags; the top 5 by
+        // shared-tag count, then Jaccard), but the scan is driven by a tag
+        // inverted index instead of comparing every card against every other
+        // card. The old shape was O(N²) tag scans AND O(N²) `new Set(tokens)`
+        // constructions — the worst freeze in a long-lived store.
         const corpusEntries = [...corpus.entries()].filter(([, c]) => c.meta.validUntil === null);
         const liveIds = new Set(corpusEntries.map(([id]) => id));
+        const byTag = new Map<string, string[]>();
         for (const [id, c] of corpusEntries) {
-          const best = corpusEntries
-            .filter(([oid]) => oid !== id)
-            .map(([oid, o]) => {
-              const shared = c.meta.tags.filter((t) => o.meta.tags.includes(t)).length;
-              return { oid, shared, sim: jaccard(new Set(c.tokens), new Set(o.tokens)) };
-            })
-            .filter((x) => x.shared >= 2)
-            .sort((a, b) => b.shared * 10 + b.sim - (a.shared * 10 + a.sim))
-            .slice(0, 5)
-            .map((x) => x.oid);
-          const current = (c.meta.links ?? []).filter((linkId) => liveIds.has(linkId));
-          if (JSON.stringify(best) !== JSON.stringify(current)) {
-            // rebuild: false — pass 5 rebuilds the index once for the run.
-            const patched = await store.patchCard(id, { links: best }, { rebuild: false });
-            if (patched) {
-              c.meta.links = best;
-              res.relinked++;
+          for (const tag of c.meta.tags) {
+            const list = byTag.get(tag);
+            if (list === undefined) byTag.set(tag, [id]);
+            else list.push(id);
+          }
+        }
+        const relinkChanges: { id: string; patch: { links: string[] } }[] = [];
+        let relinkDeadlineHit = false;
+        for (const [id, c] of corpusEntries) {
+          await yieldNow();
+          if (Date.now() > deadline) {
+            relinkDeadlineHit = true;
+            break;
+          }
+          const shared = new Map<string, number>();
+          for (const tag of c.meta.tags) {
+            for (const oid of byTag.get(tag) ?? []) {
+              if (oid === id) continue;
+              shared.set(oid, (shared.get(oid) ?? 0) + 1);
             }
           }
+          const cSet = tokenSets.get(id) ?? EMPTY_TOKENS;
+          const best = [...shared.entries()]
+            .filter(([, n]) => n >= 2)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, RELINK_CANDIDATE_CAP)
+            .map(([oid, n]) => ({ oid, score: n * 10 + jaccard(cSet, tokenSets.get(oid) ?? EMPTY_TOKENS) }))
+            .sort((a, b) => b.score - a.score)
+            .slice(0, RELINK_LINKS)
+            .map((x) => x.oid);
+          const current = (c.meta.links ?? []).filter((linkId) => liveIds.has(linkId));
+          if (JSON.stringify(best) !== JSON.stringify(current)) relinkChanges.push({ id, patch: { links: best } });
+        }
+        if (relinkDeadlineHit) {
+          res.notes.push('wall budget exhausted during relink; the remaining links resume next run');
+        }
+        if (relinkChanges.length > RELINK_WRITE_CAP) {
+          // A fresh large store changes EVERY card's links at once (a ~20 s
+          // write burst measured at 3000 cards). Cap the burst: written cards
+          // become stable, so the next run only sees the unwritten remainder
+          // and the whole store converges over a few runs instead of stalling
+          // one.
+          res.notes.push(
+            `relink: writing ${RELINK_WRITE_CAP}/${relinkChanges.length} changed card(s) this run (rest resume next run)`,
+          );
+          relinkChanges.length = RELINK_WRITE_CAP;
+        }
+        if (relinkChanges.length > 0) {
+          // rebuild: false — pass 5 rebuilds the index once for the run. One
+          // batched write instead of one lock + read + write per card.
+          const applied = await store.patchCards(relinkChanges, { rebuild: false });
+          for (const change of relinkChanges) {
+            const entry = corpus.get(change.id);
+            if (entry !== undefined) entry.meta.links = change.patch.links;
+          }
+          res.relinked += applied;
         }
 
         // ── pass 4b: LLM passes (best-effort, budgeted) ────────────────────
@@ -459,9 +564,45 @@ export class DreamEngine {
           await this.runLlmSummarize(store, llm, corpus, res).catch((err) => {
             res.notes.push(`llm-summarize skipped: ${err instanceof Error ? err.message : String(err)}`);
           });
-          await this.runLlmConflict(store, llm, corpus, res).catch((err) => {
+          await this.runLlmConflict(store, llm, corpus, tokenSets, res).catch((err) => {
             res.notes.push(`llm-conflict skipped: ${err instanceof Error ? err.message : String(err)}`);
           });
+        }
+
+        // ── pass 6: capacity maintenance (bounded growth) ───────────────────
+        // The ceilings that stop a store from growing forever: stale/low-value
+        // cards are archived, and the archive/audit/access budgets are pruned.
+        // The run corpus is handed over directly (it is AHEAD of the on-disk
+        // index mid-run), and the inbox is left to the checkpoint below, which
+        // owns this run's offset.
+        const maint = this.getSettings().maintenance;
+        if (maint === undefined || maint.enabled) {
+          try {
+            const mres = await maintainStore(store, {
+              limits: maintenanceLimitsFrom(this.getSettings()),
+              entries: [...corpus.entries()].map(([id, c]) => [id, c.meta] as const),
+              logger: this.logger,
+              rebuildIndex: false, // pass 5 rebuilds once for the run
+              skipInbox: true,
+              now: nowD,
+              deadline,
+            });
+            res.archived += mres.staleArchived + mres.budgetArchived;
+            res.pruned += mres.archivePruned + mres.auditPruned + mres.accessPruned;
+            if (mres.staleArchived + mres.budgetArchived > 0) {
+              res.notes.push(
+                `maintenance: archived ${mres.staleArchived} stale + ${mres.budgetArchived} over-budget card(s)`,
+              );
+            }
+            if (mres.archivePruned + mres.auditPruned + mres.accessPruned > 0) {
+              res.notes.push(
+                `maintenance: pruned archive=${mres.archivePruned} audit=${mres.auditPruned} access=${mres.accessPruned} (~${mres.bytesReclaimed}B)`,
+              );
+            }
+            if (mres.truncated) res.notes.push('maintenance: wall budget exhausted; the card sweep resumes next run');
+          } catch (err) {
+            res.notes.push(`maintenance skipped: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
 
         // ── pass 5: reindex (derived artifact) ─────────────────────────────
@@ -469,14 +610,23 @@ export class DreamEngine {
         // rebuild: false), so the run's index I/O is O(N), not O(N²).
         await store.rebuildIndex();
 
-        // ── inbox compaction (budget.maxInboxLines) ─────────────────────────
+        // ── inbox compaction (line + byte budget) ──────────────────────────
         // Keep the inbox file bounded: drop the CONSUMED head once it grows
-        // past the cap. Pending (unconsumed) lines are never dropped — the
+        // past either cap. Pending (unconsumed) lines are never dropped — the
         // drop is capped at the offset — and the offset is adjusted in the
         // SAME checkpoint write below, so the pair can never disagree.
         const maxInboxLines = this.getSettings().budget.maxInboxLines;
+        const maxInboxBytes = this.getSettings().maintenance?.maxInboxBytes ?? 0;
         const totalLines = await store.inboxLineCount();
-        const dropLines = Math.min(Math.max(0, totalLines - maxInboxLines), state.inboxOffset);
+        let dropLines = Math.min(Math.max(0, totalLines - maxInboxLines), state.inboxOffset);
+        if (maxInboxBytes > 0 && totalLines > 0) {
+          const bytes = await store.inboxBytes();
+          if (bytes > maxInboxBytes) {
+            const avgLine = bytes / totalLines;
+            const forBytes = Math.ceil((bytes - maxInboxBytes) / Math.max(1, avgLine));
+            dropLines = Math.min(Math.max(dropLines, forBytes), state.inboxOffset);
+          }
+        }
         if (dropLines > 0) {
           await store.compactInbox(dropLines);
           state.inboxOffset -= dropLines;
@@ -499,7 +649,7 @@ export class DreamEngine {
           ts: nowIso(),
           store: store.slug,
           op: 'dream',
-          detail: `+${res.added} ~${res.updated} =${res.noop} ↓${res.archived} ⊃${res.superseded} ⊘${res.blocked} link=${res.relinked}`,
+          detail: `+${res.added} ~${res.updated} =${res.noop} ↓${res.archived} ⊃${res.superseded} ⊘${res.blocked} link=${res.relinked} gc=${res.pruned}`,
           via: 'dream',
         });
 
@@ -570,23 +720,43 @@ export class DreamEngine {
     store: MemoryStore,
     llm: DreamLlm,
     corpus: Map<string, { meta: import('./types.ts').CardMeta; tokens: string[] }>,
+    tokenSets: ReadonlyMap<string, Set<string>>,
     res: StoreDreamResult,
   ): Promise<void> {
     const entries = [...corpus.entries()]
       .filter(([, { meta }]) => meta.validUntil === null)
       .map(([id, c]) => ({ id, meta: c.meta, tokens: c.tokens }));
     const pairs: { a: { id: string; meta: import('./types.ts').CardMeta; tokens: string[] }; b: { id: string; meta: import('./types.ts').CardMeta; tokens: string[] }; sim: number }[] = [];
+    const yieldNow = createYielder();
+    let evals = 0;
+    let capped = false;
     for (let i = 0; i < entries.length && pairs.length < CONFLICT_MAX_PAIRS; i++) {
       for (let j = i + 1; j < entries.length && pairs.length < CONFLICT_MAX_PAIRS; j++) {
         const a = entries[i];
         const b = entries[j];
         if (a === undefined || b === undefined) continue;
-        const sim = jaccard(new Set(a.tokens), new Set(b.tokens));
+        const sa = tokenSets.get(a.id);
+        const sb = tokenSets.get(b.id);
+        if (sa === undefined || sb === undefined) continue;
+        // jaccard ≤ min/max, so a pair whose token sets differ wildly in size
+        // cannot reach the band's lower bound. Cheap integer check before the
+        // expensive intersection.
+        const min = Math.min(sa.size, sb.size);
+        const max = Math.max(sa.size, sb.size);
+        if (max === 0 || min / max < CONFLICT_SIM_MIN) continue;
+        if (++evals > CONFLICT_MAX_EVALS) {
+          capped = true;
+          break;
+        }
+        await yieldNow();
+        const sim = jaccard(sa, sb);
         if (sim >= CONFLICT_SIM_MIN && sim < CONFLICT_SIM_MAX) {
           pairs.push({ a, b, sim });
         }
       }
+      if (capped) break;
     }
+    if (capped) res.notes.push(`llm-conflict: pair scan capped at ${CONFLICT_MAX_EVALS} comparisons`);
     if (pairs.length === 0) return;
     const line = async (c: { id: string; meta: import('./types.ts').CardMeta }): Promise<DreamCardLine> => {
       const card = await store.readCard(c.id).catch(() => null);
@@ -653,6 +823,27 @@ const SUMMARIZE_MAX_CARDS = 40;
 const CONFLICT_SIM_MIN = 0.3;
 const CONFLICT_SIM_MAX = 0.85;
 const CONFLICT_MAX_PAIRS = 4;
+/**
+ * Ceiling on pair comparisons for the best-effort conflict pass. The scan is
+ * inherently pairwise; a cap (plus the token-length prefilter) keeps it from
+ * becoming an O(N²) freeze as a store grows. Reaching it only means some pairs
+ * are not considered this run — the pass is advisory, never a correctness gate.
+ */
+const CONFLICT_MAX_EVALS = 20_000;
+/** Max links written per card by the relink pass. */
+const RELINK_LINKS = 5;
+/**
+ * How many shared-tag candidates get the (more expensive) Jaccard comparison.
+ * Shared-tag count dominates the ranking by construction (×10 vs a 0..1
+ * similarity), so the top-5 can only come from the top of this list.
+ */
+const RELINK_CANDIDATE_CAP = 64;
+/**
+ * Max link rewrites per Dream run. Writing every changed card in one run is a
+ * multi-second burst on a fresh large store; the pass is idempotent, so the
+ * remainder simply converges on later runs.
+ */
+const RELINK_WRITE_CAP = 500;
 
 function round2(x: number): number {
   return Math.round(x * 100) / 100;
@@ -676,6 +867,7 @@ async function writeReport(dreamDir: string, r: { slug: string; ts: string; res:
     `- superseded: ${r.res.superseded ?? 0}`,
     `- blocked: ${r.res.blocked}`,
     `- relinked: ${r.res.relinked}`,
+    `- pruned: ${r.res.pruned ?? 0}`,
     r.res.error ? `- **error**: ${r.res.error}` : '',
     '',
     r.notes.length > 0 ? '## Notes\n' + r.notes.map((n) => `- ${n}`).join('\n') : 'No notes.',

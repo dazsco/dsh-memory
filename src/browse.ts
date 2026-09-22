@@ -165,7 +165,7 @@ export interface BrowseDreamResult {
   ts: string;
   durationMs: number;
   llmCalls: number;
-  stores: { slug: string; added: number; updated: number; noop: number; archived: number; superseded: number; blocked: number; relinked: number; error: string }[];
+  stores: { slug: string; added: number; updated: number; noop: number; archived: number; superseded: number; blocked: number; relinked: number; pruned: number; error: string }[];
 }
 
 // ── handlers ──────────────────────────────────────────────────────────────
@@ -567,6 +567,7 @@ export function makeBrowseHandlers(deps: MemoryBrowseDeps): {
           superseded?: number;
           blocked: number;
           relinked: number;
+          pruned?: number;
           error?: string;
         }[];
       };
@@ -585,6 +586,7 @@ export function makeBrowseHandlers(deps: MemoryBrowseDeps): {
           superseded: s.superseded ?? 0,
           blocked: s.blocked,
           relinked: s.relinked,
+          pruned: s.pruned ?? 0,
           error: s.error ?? '',
         })),
       };

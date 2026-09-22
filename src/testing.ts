@@ -16,15 +16,46 @@ export type {
   RecallHit,
   StatusReport,
   StoreStatus,
+  StoreMaintenanceResult,
+  MaintainReport,
   MemoryExportBundle,
   MemoryExportStore,
   MemoryImportResult,
   MemoryImportStoreResult,
 } from './types.ts';
 
-export { readTextSafe, readJsonSafe, writeJsonAtomic, appendJsonl, readJsonlLines, readJsonlLinesLenient, listFiles, mtimeMsSafe, ensureDir } from './fsutil.ts';
+export {
+  readTextSafe,
+  readJsonSafe,
+  writeJsonAtomic,
+  writeJsonCompactAtomic,
+  appendJsonl,
+  readJsonlLines,
+  readJsonlLinesLenient,
+  readTailText,
+  countNonEmptyLines,
+  createYielder,
+  listFiles,
+  mtimeMsSafe,
+  sizeSafe,
+  ensureDir,
+} from './fsutil.ts';
 
-export { makeCardId, parseCard, serializeCard, cardDigest, cardTokenCount, cardIdFromFileName, isValidCardId, readCardFile, writeCardFile, assertRoundTrip } from './cards.ts';
+export {
+  makeCardId,
+  parseCard,
+  serializeCard,
+  cardDigest,
+  cardTokenCount,
+  cardMetaOf,
+  capTerms,
+  INDEX_TERMS_CAP,
+  cardIdFromFileName,
+  isValidCardId,
+  readCardFile,
+  writeCardFile,
+  assertRoundTrip,
+} from './cards.ts';
 
 export { SECRET_PATTERNS, scanSecrets, redactPii, gateCandidate } from './redact.ts';
 export type { SecretScan, PiiMode, PiiResult } from './redact.ts';
@@ -32,11 +63,20 @@ export type { SecretScan, PiiMode, PiiResult } from './redact.ts';
 export { parseMemorySection, mergeRules, emptyRules } from './rules.ts';
 export type { MemoryRules } from './rules.ts';
 
-export { tokenize, jaccard, bm25Score, cardRecency, cardStrength, compositeScore, rankWithMmr, makeSnippet, expandLinks, passesFilter } from './retrieval.ts';
+export { tokenize, jaccard, bm25Score, cardRecency, cardStrength, compositeScore, rankWithMmr, mmrPool, MMR_POOL_MIN, MMR_POOL_FACTOR, makeSnippet, expandLinks, passesFilter } from './retrieval.ts';
 export type { ScoredCandidate, RecallFilter, FilterableMeta } from './retrieval.ts';
 
 export { dedupDecide, normalizeMemoryText, DEDUP_THRESHOLDS } from './dedup.ts';
 export type { DedupDecision, DedupAction } from './dedup.ts';
+
+export {
+  maintainStore,
+  maintenanceLimitsFrom,
+  selectMaintenance,
+  cardValue,
+  DEFAULT_MAINTENANCE_LIMITS,
+} from './maintain.ts';
+export type { MaintenanceLimits, MaintenanceSelection, MaintainStoreOptions } from './maintain.ts';
 
 export {
   memoryRoot,
@@ -47,6 +87,9 @@ export {
   slugForPath,
   hash36,
   findProjectRoot,
+  isValidStoreSlug,
+  EXPLICIT_PROJECT_MARKER,
+  PROJECT_ROOT_MARKERS,
   loadProjectsRegistry,
   saveProjectsRegistry,
   registerProjectPath,
@@ -64,8 +107,8 @@ export { healOrphanLock, isLockTimeout } from './lockheal.ts';
 export { MemoryCore, normalizeTags } from './core.ts';
 export type { RememberInput, RecallOptions, ForgetOptions, ForgetResult, CardRef } from './core.ts';
 
-export { MemorySettingsSchema, defaultMemorySettings, MEMORY_NS } from './settings.ts';
-export type { MemorySettings } from './settings.ts';
+export { MemorySettingsSchema, defaultMemorySettings, readMemorySettings, MEMORY_NS } from './settings.ts';
+export type { MemorySettings, MemoryConfig, CaptureSettings, DreamSettings, BriefSettings, RecallSettings, BudgetSettings, MaintenanceSettings, LlmSettings, RedactSettings, CommandsSettings } from './settings.ts';
 
 export { buildBrief } from './brief.ts';
 export type { BriefOptions } from './brief.ts';
@@ -115,4 +158,4 @@ export type {
   BrowseDreamResult,
 } from './browse.ts';
 
-export { apply } from './index.ts';
+export { apply, Config } from './index.ts';

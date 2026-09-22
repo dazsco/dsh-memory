@@ -15,6 +15,13 @@ export interface BriefOptions {
   globalK: number;
   /** Include cards the agent already superseded (default false). */
   includeSuperseded?: boolean;
+  /**
+   * The session HAS a cwd but no project root could be resolved. Renders a
+   * short note so the model (and a human reading the session) knows project
+   * memories will land in the GLOBAL store — a silent fallback is how the
+   * taunix memory went "missing".
+   */
+  projectUnresolved?: boolean;
 }
 
 const FRAME_OPEN = '<system-reminder>';
@@ -82,6 +89,13 @@ export async function buildBrief(core: MemoryCore, opts: BriefOptions): Promise<
       }
       // A section whose lines were ALL budget-dropped is omitted entirely:
       // a bare header with a stale "(8)" count reads as "injected but empty".
+    }
+    if (opts.projectSlug === null && opts.projectUnresolved === true) {
+      parts.push(
+        '## 项目记忆 (0)',
+        '（未识别到项目根：cwd 向上 12 层内无 .git 或项目标记文件，本会话的项目记忆将写入全局库；' +
+          '如需独立项目库，在项目根放一个空的 .dsh-memory.json）',
+      );
     }
     return parts;
   };

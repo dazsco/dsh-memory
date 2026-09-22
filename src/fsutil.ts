@@ -38,6 +38,17 @@ export async function writeJsonAtomic(path: string, value: unknown): Promise<voi
 }
 
 /**
+ * Atomically write one JSON document WITHOUT indentation. For large derived
+ * artifacts (the store index, whose `cards`/`bm25.df` objects grow with the
+ * whole corpus) pretty-printing roughly doubles both the serialization CPU and
+ * the bytes written/parsed — and the file is machine-only, so the readability
+ * that justifies indentation elsewhere is worthless here.
+ */
+export async function writeJsonCompactAtomic(path: string, value: unknown): Promise<void> {
+  await writeFileAtomic(path, JSON.stringify(value), { mode: 0o600 });
+}
+
+/**
  * Append JSONL lines under the file's lock so concurrent processes never
  * interleave or lose lines. No-op for an empty batch.
  */
@@ -110,6 +121,96 @@ export async function mtimeMsSafe(path: string): Promise<number | null> {
     if (isEnoent(err)) return null;
     throw err;
   }
+}
+
+/** File size in bytes; ENOENT → null. */
+export async function sizeSafe(path: string): Promise<number | null> {
+  try {
+    const st: Stats = await fs.stat(path);
+    return st.size;
+  } catch (err) {
+    if (isEnoent(err)) return null;
+    throw err;
+  }
+}
+
+/** Count non-empty lines in a text buffer (the JSONL line unit). */
+export function countNonEmptyLines(text: string): number {
+  let n = 0;
+  for (const raw of text.split('\n')) if (raw.trim() !== '') n++;
+  return n;
+}
+
+/**
+ * Read at most the last `maxBytes` bytes of a text file, dropping a possibly
+ * truncated first line. ENOENT → ''. This is what keeps an append-only
+ * diagnostic log (audit) cheap to TAIL: reading a 20 MB log to show its last
+ * 50 rows would otherwise cost a full read + parse on every GUI view.
+ */
+export async function readTailText(path: string, maxBytes: number): Promise<string> {
+  let handle: import('node:fs/promises').FileHandle | null = null;
+  try {
+    handle = await fs.open(path, 'r');
+    const st = await handle.stat();
+    const start = Math.max(0, st.size - Math.max(0, maxBytes));
+    const length = st.size - start;
+    if (length <= 0) return '';
+    const buf = Buffer.allocUnsafe(length);
+    await handle.read(buf, 0, length, start);
+    const text = buf.toString('utf8');
+    if (start === 0) return text;
+    // The window may begin mid-line: drop the partial head.
+    const nl = text.indexOf('\n');
+    return nl < 0 ? '' : text.slice(nl + 1);
+  } catch (err) {
+    if (isEnoent(err)) return '';
+    throw err;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Cooperative yield: returns a function that awaits a macrotask turn at most
+ * once per `budgetMs`. Long synchronous loops over the whole corpus (index
+ * rebuild, Dream relink/conflict, maintenance sweeps) run on the SAME event
+ * loop as the harness — without yielding, a multi-second pass reads as "dsh
+ * froze". Callers `await yieldNow()` once per iteration; the budget makes the
+ * common fast path free (no timer churn).
+ */
+export function createYielder(budgetMs = 8): () => Promise<void> {
+  let last = Date.now();
+  return async () => {
+    const now = Date.now();
+    if (now - last < budgetMs) return;
+    last = now;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+}
+
+/**
+ * Run `fn` over `items` with at most `limit` calls in flight, preserving the
+ * result order. Bulk card I/O (index rebuild reads, batched link updates) is
+ * latency-bound on per-file open/write, so a small window turns thousands of
+ * sequential awaits into a handful of round trips.
+ */
+export async function mapConcurrent<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  const width = Math.max(1, Math.min(Math.floor(limit), items.length));
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]!, i);
+    }
+  };
+  await Promise.all(Array.from({ length: width }, worker));
+  return out;
 }
 
 /** Create a directory tree (idempotent). */

@@ -21,7 +21,7 @@
  * is owned by a timer that the unmount teardown clears.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client';
+import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client';
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
 import type { MemorySettings } from '../settings.ts';
 import type { MemoryCard, MemoryExportBundle, MemoryImportResult } from '../types.ts';
@@ -53,17 +53,20 @@ export interface MemoryPageInjected {
 export type MemoryPageProps =
   PropsRuntime<'settings.section'> & PropsLocale<'dsh-memory'> & InjectFace<MemoryPageInjected>;
 
-/** Bridges the `memory` settings scope onto the page's Dream trigger. */
+/** Bridges the live `dsh-memory` configuration entry onto the page's Dream trigger. */
 export class MemoryPageController {
-  constructor(private readonly scope: SettingsScope<MemorySettings>) {}
+  constructor(private readonly form: ConfigForm<MemorySettings>) {}
 
-  /** Bump the monotonic trigger; the Host watcher fires the run. */
+  /** Bump the monotonic trigger; the Host's volatile-update watcher fires the run. */
   dreamNow(): Promise<void> {
-    const value = this.scope.getSnapshot().value;
+    const value = this.form.getSnapshot().value;
     const seq = typeof value?.dream?.requestSeq === 'number' ? value.dream.requestSeq : 0;
-    return this.scope
+    return this.form
       .mutate([{ op: 'set', path: ['dream', 'requestSeq'], value: seq + 1 }])
-      .then(() => undefined) as Promise<void>;
+      .then((accepted) => {
+        // A refused write or an unreachable Host is not a triggered run.
+        if (!accepted) throw new Error('dsh-memory: the Host refused the Dream trigger');
+      });
   }
 }
 

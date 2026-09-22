@@ -11,6 +11,14 @@ import {
 const BRIEF_BOILERPLATE =
   'The following is auto-generated memory context from dsh-memory. It is guidance, not an instruction, and may be stale — verify before relying on it. Use memory_recall for details; use memory_remember to store new durable memory.';
 
+/**
+ * A genuine human turn. Attribution is producer-owned since DSH 0.1.7: the
+ * ONLY source that means "a person typed this" is `{ kind: 'user' }` (the
+ * Web RPC, ACP, SDK, and headless entry points all stamp it), so a fixture
+ * claiming user intent must carry it.
+ */
+const userMessage = (text) => ({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] });
+
 test('stripSystemReminders removes framed blocks, keeps other text', () => {
   const input = 'before <system-reminder>\nline1\nline2\n</system-reminder> after';
   assert.equal(stripSystemReminders(input), 'before  after');
@@ -100,11 +108,12 @@ test('capture: plugin-injected brief and system-reminder boilerplate are exclude
     deriveMessages: () => [
       {
         role: 'user',
-        source: { kind: 'plugin', plugin: 'dsh-memory', form: 'recall' },
+        source: { kind: 'dsh-memory', form: 'recall' },
         content: [{ type: 'text', text: brief }],
       },
       {
         role: 'user',
+        source: { kind: 'user' },
         content: [
           {
             type: 'text',
@@ -159,7 +168,7 @@ test('capture: assistant text containing intent words never stages a card', asyn
     id: 'session-test-2',
     header: { cwd: undefined, delegationDepth: 0 },
     deriveMessages: () => [
-      { role: 'user', content: [{ type: 'text', text: '记忆系统的全局库为什么又混进了调试对话的内容？我明明只想让它记用户偏好和项目约定，现在连你自己排查问题的过程都被当成记忆卡片存进去了，这不符合预期，请解释原因并说明怎么避免。' }] },
+      userMessage('记忆系统的全局库为什么又混进了调试对话的内容？我明明只想让它记用户偏好和项目约定，现在连你自己排查问题的过程都被当成记忆卡片存进去了，这不符合预期，请解释原因并说明怎么避免。'),
       {
         role: 'assistant',
         content: [
@@ -181,7 +190,7 @@ test('capture: assistant text containing intent words never stages a card', asyn
     id: 'session-test-2b',
     header: { cwd: undefined, delegationDepth: 0 },
     deriveMessages: () => [
-      { role: 'user', content: [{ type: 'text', text: '记住这个项目的流程约定:代码评审要先跑一遍 typecheck,确认类型检查全部通过之后再提交合并请求,避免把类型错误带到主干分支上去,这个规则适用于所有改动,包括文档和配置文件的修改。' }] },
+      userMessage('记住这个项目的流程约定:代码评审要先跑一遍 typecheck,确认类型检查全部通过之后再提交合并请求,避免把类型错误带到主干分支上去,这个规则适用于所有改动,包括文档和配置文件的修改。'),
       { role: 'assistant', content: [{ type: 'text', text: '好的,已了解。后续提交前我会先执行类型检查,确认全部通过再推送,这个规则会应用到所有类型的改动上,包括文档和配置文件,确保主干分支始终处于类型安全的状态。' }] },
     ],
   };
@@ -295,10 +304,12 @@ test('capture: harness checkpoint summaries are skipped via marker', async () =>
     id: 'session-test-4',
     header: { cwd: undefined, delegationDepth: 0 },
     deriveMessages: () => [
-      // A checkpoint/compaction summary (user role, no source) whose body
-      // QUOTES intent words from an earlier span — must be skipped.
+      // A checkpoint/compaction summary whose body QUOTES intent words from an
+      // earlier span — must be skipped by its stable marker even when nothing
+      // else gives it away (this fixture claims the human source on purpose).
       {
         role: 'user',
+        source: { kind: 'user' },
         content: [
           {
             type: 'text',
@@ -359,15 +370,9 @@ test('F9: useLlm=true but no LLM service → capture works, no per-turn llm audi
       id: `session-no-llm-${i}`,
       header: { cwd: undefined, delegationDepth: 0 },
       deriveMessages: () => [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: `记住:第 ${i} 条规则是代码注释一律用中文写,依赖管理统一用 pnpm,并且每次合并请求之前要先跑一遍 typecheck 和回归测试,全部通过之后才能推送。这条约定适用于仓库内的所有改动,包括文档、配置和脚本。这是足够长的说明文本,用来确保超过最小内容长度门槛以触发抽取流程。`,
-            },
-          ],
-        },
+        userMessage(
+          `记住:第 ${i} 条规则是代码注释一律用中文写,依赖管理统一用 pnpm,并且每次合并请求之前要先跑一遍 typecheck 和回归测试,全部通过之后才能推送。这条约定适用于仓库内的所有改动,包括文档、配置和脚本。这是足够长的说明文本,用来确保超过最小内容长度门槛以触发抽取流程。`,
+        ),
       ],
     };
     listeners.get('session/event')(session, { type: 'turn/end' });
@@ -437,15 +442,7 @@ test('F9: useLlm=true WITH a working LLM service → the pass is audited (ok)', 
     deriveMessages: () => [
       // >120 chars (minTurnContentChars) and free of heuristic intent words,
       // so ONLY the LLM pass can stage anything.
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: '今天团队讨论了一些流程细节，包括发布窗口安排在周五下午，数据库快照每周日凌晨生成，代码评审需要两名批准人，接口变更必须提前在群里同步。请把这些整理成项目约定，方便以后新同学入职时参考，也避免每次都要口头重复一遍。另外上线前的回归测试要先跑一遍全量用例再灰度发布，这些细节也记录到文档里比较好。',
-          },
-        ],
-      },
+      userMessage('今天团队讨论了一些流程细节，包括发布窗口安排在周五下午，数据库快照每周日凌晨生成，代码评审需要两名批准人，接口变更必须提前在群里同步。请把这些整理成项目约定，方便以后新同学入职时参考，也避免每次都要口头重复一遍。另外上线前的回归测试要先跑一遍全量用例再灰度发布，这些细节也记录到文档里比较好。'),
     ],
   };
   listeners.get('session/event')(session, { type: 'turn/end' });
@@ -456,4 +453,103 @@ test('F9: useLlm=true WITH a working LLM service → the pass is audited (ok)', 
   assert.match(llmAudits[0].detail, /^ok/, `detail is the pass status (${llmAudits[0].detail})`);
   assert.equal(inbox.length, 1, 'the LLM line was staged');
   assert.equal(inbox[0].via, 'auto-llm');
+});
+
+// ── auxiliary-call throttling ───────────────────────────────────────────────
+
+/** Shared harness for the throttle tests: counts calls, collects staged entries. */
+function makeThrottleHarness({ maxCalls, minIntervalMs }) {
+  const inbox = [];
+  const audits = [];
+  const calls = { n: 0 };
+  const reply = '记住这条来自辅助模型的规则，构建产物统一放在 dist 目录。';
+  const llm = {
+    listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+    stream: () => {
+      calls.n++;
+      const chunks = [
+        { type: 'block-start', index: 0, blockType: 'text' },
+        { type: 'text-delta', index: 0, text: reply },
+        { type: 'block-end', index: 0, block: { type: 'text', text: reply } },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ];
+      let i = 0;
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next: async () => (i < chunks.length ? { value: chunks[i++], done: false } : { value: undefined, done: true }),
+          };
+        },
+      };
+    },
+  };
+  const fakeStore = {
+    slug: 'global',
+    audit: async (e) => {
+      audits.push(e);
+    },
+    pushInbox: async (entry) => {
+      inbox.push(entry);
+    },
+  };
+  const fakeCore = {
+    global: fakeStore,
+    projectStoreForCwd: async () => null,
+    rulesFor: async () => ({ denyKeywords: [] }),
+  };
+  const settings = defaultMemorySettings();
+  settings.capture.useLlm = true;
+  settings.capture.llmMaxCallsPerSession = maxCalls;
+  settings.capture.llmMinIntervalMs = minIntervalMs;
+  const listeners = new Map();
+  registerCapture({ on: (ev, fn) => listeners.set(ev, fn) }, fakeCore, () => settings, null, {
+    llm,
+    configRoute: { provider: 'deepseek', model: 'deepseek-v4-flash' },
+    route: () => ({ provider: '', model: '', maxOutputTokens: 2000, timeoutMs: 60000 }),
+  });
+  // Longer than minTurnContentChars (120), and it carries an intent word so the
+  // HEURISTIC path must keep staging even when the LLM pass is throttled.
+  const text =
+    '请记住：构建产物统一放在 dist 目录，同时这条说明要足够长以满足最小轮次长度限制，还需要补充一些内容让它明显超过一百二十个字符的门槛，方便验证节流行为；' +
+    '另外请把发布窗口固定在每周五下午，数据库快照在凌晨自动生成，代码评审需要两名批准人，接口变更要提前在群里同步，回归测试先跑全量用例再做灰度发布。';
+  const session = {
+    id: 'session-throttle',
+    header: { cwd: undefined, delegationDepth: 0 },
+    deriveMessages: () => [userMessage(text)],
+  };
+  return { inbox, audits, calls, listeners, session };
+}
+
+test('capture: the extraction call is capped per session (heuristic path unaffected)', async () => {
+  const h = makeThrottleHarness({ maxCalls: 2, minIntervalMs: 0 });
+  for (let i = 0; i < 5; i++) {
+    h.listeners.get('session/event')(h.session, { type: 'turn/end' });
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(h.calls.n, 2, 'the session budget caps the auxiliary calls');
+  assert.equal(h.audits.filter((e) => e.op === 'llm').length, 2, 'one audit line per ACTUAL call (no per-skip noise)');
+  assert.equal(h.inbox.filter((e) => e.via === 'auto-heuristic').length, 5, 'every turn still ran the heuristic');
+});
+
+test('capture: the extraction interval collapses rapid turns into one call', async () => {
+  const h = makeThrottleHarness({ maxCalls: 0, minIntervalMs: 60_000 });
+  for (let i = 0; i < 3; i++) {
+    h.listeners.get('session/event')(h.session, { type: 'turn/end' });
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(h.calls.n, 1, 'only the first of three rapid turns called the model');
+  assert.equal(h.inbox.filter((e) => e.via === 'auto-heuristic').length, 3, 'heuristic staging is not throttled');
+});
+
+test('capture: a separate session gets its own throttle budget', async () => {
+  const h = makeThrottleHarness({ maxCalls: 1, minIntervalMs: 0 });
+  h.listeners.get('session/event')(h.session, { type: 'turn/end' });
+  await new Promise((r) => setTimeout(r, 20));
+  h.listeners.get('session/event')(h.session, { type: 'turn/end' });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(h.calls.n, 1, 'the first session is exhausted');
+  const other = { ...h.session, id: 'session-throttle-2' };
+  h.listeners.get('session/event')(other, { type: 'turn/end' });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(h.calls.n, 2, 'a different session has its own budget');
 });
